@@ -144,7 +144,8 @@ func (o *observer) publishEvent(ctx context.Context, evt *event.Event) error {
 		return fmt.Errorf("observer: failed to publish event: %w", err)
 	}
 
-	o.logger.Info("Argus observation event published",
+	// Debug, not Info: one line per event (several per unit) was most of a service's log volume.
+	o.logger.Debug("Argus observation event published",
 		zap.String("event_type", evt.Type),
 		zap.String("workflow_id", evt.WorkflowID),
 		zap.String("run_id", evt.RunID),
