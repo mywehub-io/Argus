@@ -19,6 +19,12 @@ type Options struct {
 	// Default: 1000000
 	StreamMaxMsgs int64
 
+	// StreamMaxBytes caps the stream's size on disk; above it the oldest events are dropped. An
+	// existing stream is brought to this value at start. Without it OBSERVATION grew to 14 GB and,
+	// with the other streams, filled the NATS disk (UAT incident 08/10/2026, C2).
+	// Default: 4 GiB
+	StreamMaxBytes int64
+
 	// PublishTimeout is the timeout for publishing events to JetStream
 	// Default: 5 seconds
 	PublishTimeout time.Duration
@@ -46,6 +52,7 @@ func DefaultOptions() Options {
 		StreamName:        event.StreamName,
 		StreamMaxAge:      30 * 24 * time.Hour, // 30 days
 		StreamMaxMsgs:     1000000,
+		StreamMaxBytes:    DefaultStreamMaxBytes,
 		PublishTimeout:    5 * time.Second,
 		AsyncWorkers:      4,
 		DropLogInterval:   30 * time.Second,
@@ -68,6 +75,15 @@ func (o Options) WithStreamName(name string) Options {
 // WithStreamMaxAge sets the stream max age
 func (o Options) WithStreamMaxAge(age time.Duration) Options {
 	o.StreamMaxAge = age
+	return o
+}
+
+// DefaultStreamMaxBytes is the default StreamMaxBytes, 4 GiB.
+const DefaultStreamMaxBytes int64 = 4 << 30
+
+// WithStreamMaxBytes sets the stream's size cap in bytes.
+func (o Options) WithStreamMaxBytes(maxBytes int64) Options {
+	o.StreamMaxBytes = maxBytes
 	return o
 }
 

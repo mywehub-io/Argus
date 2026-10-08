@@ -20,6 +20,7 @@ type MockJetStream struct {
 	streams       map[string]*nats.StreamInfo
 	publishedMsgs []PublishedMessage
 	publishErr    error // if non-nil, Publish returns this error
+	updates       int   // UpdateStream calls
 }
 
 // SetPublishError configures the mock to return err from future Publish calls.
@@ -47,6 +48,26 @@ func (m *MockJetStream) StreamInfo(streamName string, opts ...nats.JSOpt) (*nats
 		return info, nil
 	}
 	return nil, nats.ErrStreamNotFound
+}
+
+// UpdateStream replaces an existing stream's config and counts the call.
+func (m *MockJetStream) UpdateStream(cfg *nats.StreamConfig, opts ...nats.JSOpt) (*nats.StreamInfo, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	info, exists := m.streams[cfg.Name]
+	if !exists {
+		return nil, nats.ErrStreamNotFound
+	}
+	info.Config = *cfg
+	m.updates++
+	return info, nil
+}
+
+// Updates is how many times UpdateStream was called.
+func (m *MockJetStream) Updates() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.updates
 }
 
 // AddStream creates a new stream
@@ -329,11 +350,6 @@ func (m *MockJetStream) DeleteStream(name string, opts ...nats.JSOpt) error {
 // PurgeStream is required by nats.JetStreamContext interface
 func (m *MockJetStream) PurgeStream(name string, opts ...nats.JSOpt) error {
 	return nil
-}
-
-// UpdateStream is required by nats.JetStreamContext interface
-func (m *MockJetStream) UpdateStream(cfg *nats.StreamConfig, opts ...nats.JSOpt) (*nats.StreamInfo, error) {
-	return m.AddStream(cfg, opts...)
 }
 
 // PublishAsync is required by nats.JetStreamContext interface

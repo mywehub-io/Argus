@@ -79,6 +79,9 @@ func NewObserver(js natsclient.JetStreamContext, opts Options, logger *zap.Logge
 	if opts.StreamMaxMsgs == 0 {
 		opts = opts.WithStreamMaxMsgs(DefaultOptions().StreamMaxMsgs)
 	}
+	if opts.StreamMaxBytes == 0 {
+		opts = opts.WithStreamMaxBytes(DefaultOptions().StreamMaxBytes)
+	}
 	if opts.PublishTimeout == 0 {
 		opts = opts.WithPublishTimeout(DefaultOptions().PublishTimeout)
 	}
@@ -87,6 +90,7 @@ func NewObserver(js natsclient.JetStreamContext, opts Options, logger *zap.Logge
 		StreamName:     opts.StreamName,
 		StreamMaxAge:   opts.StreamMaxAge,
 		StreamMaxMsgs:  opts.StreamMaxMsgs,
+		StreamMaxBytes: opts.StreamMaxBytes,
 		PublishTimeout: opts.PublishTimeout,
 	}
 	publisher, err := nats.NewPublisher(js, publisherConfig, logger)
