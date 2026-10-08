@@ -22,16 +22,41 @@ type Options struct {
 	// PublishTimeout is the timeout for publishing events to JetStream
 	// Default: 5 seconds
 	PublishTimeout time.Duration
+
+	// AsyncQueueSize turns on async mode when above 0: Emit validates and serialises the event,
+	// queues it and returns without waiting for the broker. When the queue is full the event is
+	// dropped and counted; Emit never blocks. 0 (default) publishes synchronously, as before.
+	AsyncQueueSize int
+
+	// AsyncWorkers is how many goroutines publish queued events. Default: 4.
+	AsyncWorkers int
+
+	// DropLogInterval is the least time between two log lines about dropped or failed events.
+	// Default: 30 seconds.
+	DropLogInterval time.Duration
+
+	// CloseFlushTimeout bounds how long Close waits for queued events to be published when the
+	// caller's context has no deadline. Default: 5 seconds.
+	CloseFlushTimeout time.Duration
 }
 
 // DefaultOptions returns default options for the Observer
 func DefaultOptions() Options {
 	return Options{
-		StreamName:     event.StreamName,
-		StreamMaxAge:   30 * 24 * time.Hour, // 30 days
-		StreamMaxMsgs:  1000000,
-		PublishTimeout: 5 * time.Second,
+		StreamName:        event.StreamName,
+		StreamMaxAge:      30 * 24 * time.Hour, // 30 days
+		StreamMaxMsgs:     1000000,
+		PublishTimeout:    5 * time.Second,
+		AsyncWorkers:      4,
+		DropLogInterval:   30 * time.Second,
+		CloseFlushTimeout: 5 * time.Second,
 	}
+}
+
+// WithAsync turns on async mode with a queue of queueSize events (see AsyncQueueSize).
+func (o Options) WithAsync(queueSize int) Options {
+	o.AsyncQueueSize = queueSize
+	return o
 }
 
 // WithStreamName sets the stream name

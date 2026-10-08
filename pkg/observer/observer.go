@@ -1,6 +1,8 @@
-// Package observer provides a synchronous interface for emitting observation events to NATS JetStream.
-// Emit publishes directly to NATS and returns the actual delivery result, so callers know
-// immediately whether the event reached the broker. Use NewObserver to create an observer.
+// Package observer provides an interface for emitting observation events to NATS JetStream.
+// By default Emit publishes directly to NATS and returns the actual delivery result, so callers
+// know immediately whether the event reached the broker. In async mode (Options.AsyncQueueSize)
+// Emit queues the event and returns at once, so a slow monitoring stream never slows the caller.
+// Use NewObserver to create an observer.
 // The default stream name matches event.StreamName.
 package observer
 
@@ -38,7 +40,7 @@ type Observer interface {
 // (write-lock) drains in-progress Emit calls before marking the observer
 // closed.
 type observer struct {
-	publisher *nats.Publisher
+	publisher publisher
 	options   Options
 	logger    *zap.Logger
 	// closeOnce ensures the close logic (marking isClosed, logging) runs exactly
@@ -48,6 +50,14 @@ type observer struct {
 	// so it waits for all in-progress Emit calls to finish before closing.
 	mu       sync.RWMutex
 	isClosed bool
+
+	// async is set in async mode (Options.AsyncQueueSize > 0).
+	async *asyncQueue
+}
+
+// publisher is what the observer publishes through; *nats.Publisher in production.
+type publisher interface {
+	Publish(ctx context.Context, subject, msgID string, data []byte) error
 }
 
 // NewObserver creates a new Observer instance.
@@ -87,11 +97,15 @@ func NewObserver(js natsclient.JetStreamContext, opts Options, logger *zap.Logge
 	logger.Info("Observer created",
 		zap.String("stream_name", opts.StreamName))
 
-	return &observer{
+	o := &observer{
 		publisher: publisher,
 		options:   opts,
 		logger:    logger,
-	}, nil
+	}
+	if opts.AsyncQueueSize > 0 {
+		o.async = newAsyncQueue(o, opts)
+	}
+	return o, nil
 }
 
 // Emit validates and publishes an observation event synchronously.
@@ -106,9 +120,9 @@ func (o *observer) Emit(ctx context.Context, evt *event.Event) error {
 	}
 
 	// Auto-populate required fields
-	if evt.ID == "" {
-		evt.ID = fmt.Sprintf("%s-%d", evt.WorkflowID, time.Now().UnixNano())
-	}
+	// The publish-time dedup id (Nats-Msg-Id): derived from the event's content unless the
+	// caller set its own.
+	evt.ID = evt.EmitID()
 	if evt.Timestamp.IsZero() {
 		evt.Timestamp = time.Now()
 	}
@@ -140,6 +154,11 @@ func (o *observer) publishEvent(ctx context.Context, evt *event.Event) error {
 		return fmt.Errorf("observer: failed to serialize event: %w", err)
 	}
 
+	if o.async != nil {
+		o.async.enqueue(ctx, queued{subject: subject, id: evt.ID, data: data, eventType: evt.Type})
+		return nil
+	}
+
 	if err := o.publisher.Publish(ctx, subject, evt.ID, data); err != nil {
 		return fmt.Errorf("observer: failed to publish event: %w", err)
 	}
@@ -156,13 +175,22 @@ func (o *observer) publishEvent(ctx context.Context, evt *event.Event) error {
 	return nil
 }
 
-// Close marks the observer as closed. Idempotent; safe to call multiple times.
-func (o *observer) Close(_ context.Context) error {
+// Close marks the observer as closed. In async mode it then waits for queued events to be
+// published, until ctx ends or, with no deadline on ctx, CloseFlushTimeout. Idempotent; safe to
+// call multiple times.
+func (o *observer) Close(ctx context.Context) error {
+	var err error
 	o.closeOnce.Do(func() {
 		o.mu.Lock()
 		o.isClosed = true
+		if o.async != nil {
+			o.async.closeQueue()
+		}
 		o.mu.Unlock()
+		if o.async != nil {
+			err = o.async.flush(ctx, o.options.CloseFlushTimeout)
+		}
 		o.logger.Info("Observer closed")
 	})
-	return nil
+	return err
 }

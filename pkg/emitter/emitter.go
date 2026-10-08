@@ -145,9 +145,18 @@ type NodeEndEmitParams struct {
 
 // ArgusNodeEndEmitter implements NodeEndEmitter using Argus observer.
 type ArgusNodeEndEmitter struct {
-	observer observer.Observer
-	uploader BlobUploader
-	logger   *zap.Logger
+	observer  observer.Observer
+	uploader  BlobUploader
+	logger    *zap.Logger
+	documents DocumentWriter
+}
+
+// WithDocuments makes the emitter write each output as the node's output document and send its
+// reference (raw payloads D9) instead of uploading a monitoring copy. A failed write falls back
+// to the inline or uploaded path. Returns e.
+func (e *ArgusNodeEndEmitter) WithDocuments(w DocumentWriter) *ArgusNodeEndEmitter {
+	e.documents = w
+	return e
 }
 
 // NewArgusNodeEndEmitter creates an emitter. observer and uploader may be nil; emission will no-op or fall back to inline.
@@ -207,10 +216,23 @@ func (e *ArgusNodeEndEmitter) EmitNodeEnd(ctx context.Context, params NodeEndEmi
 		IsInput:    false,
 	}
 
+	if e.documents != nil {
+		doc, err := documentPayload(ctx, e.documents, DocumentTarget{WorkflowID: params.WorkflowID, RunID: params.RunID,
+			NodeID: params.NodeID, Direction: DirectionOutput}, jsonBytes)
+		if err == nil {
+			payload = doc
+		} else {
+			e.logger.Warn("node output document not written, sending the output the old way",
+				zap.String("node_id", params.NodeID), zap.Error(err))
+		}
+	}
+
 	rawProduce, dotExt, isProduceFile := produceRawArtifactFromOutputJSON(jsonBytes)
 
 	var prepErr error
 	switch {
+	case payload != nil:
+		// Sent as its document.
 	case isProduceFile && e.uploader != nil:
 		blobPath := BuildMonitoringPathWithSuffix(pathCtx, dotExt)
 		if blobPath == "" {
@@ -281,6 +303,9 @@ func (e *ArgusNodeEndEmitter) EmitNodeEnd(ctx context.Context, params NodeEndEmi
 	if payload == nil {
 		return nil
 	}
+	if payload.Document == nil {
+		payload.Files = ScanFiles(jsonBytes, DirectionOutput)
+	}
 
 	evt := event.New(event.TypeNodeEnded).
 		WithClient(params.ClientID).
@@ -333,9 +358,17 @@ type NodeStartEmitParams struct {
 
 // ArgusNodeStartEmitter implements NodeStartEmitter using Argus observer.
 type ArgusNodeStartEmitter struct {
-	observer observer.Observer
-	uploader BlobUploader
-	logger   *zap.Logger
+	observer  observer.Observer
+	uploader  BlobUploader
+	logger    *zap.Logger
+	documents DocumentWriter
+}
+
+// WithDocuments makes the emitter write each input as the node's input document and send its
+// reference (raw payloads D9). A failed write falls back to the inline or uploaded path. Returns e.
+func (e *ArgusNodeStartEmitter) WithDocuments(w DocumentWriter) *ArgusNodeStartEmitter {
+	e.documents = w
+	return e
 }
 
 // NewArgusNodeStartEmitter creates an emitter. observer and uploader may be nil; emission will no-op or fall back to inline.
@@ -380,7 +413,24 @@ func (e *ArgusNodeStartEmitter) EmitNodeStart(ctx context.Context, params NodeSt
 		IsInput:    true,
 	}
 
-	payload, prepErr := PreparePayload(ctx, params.Input, pathCtx, e.uploader, nil)
+	var payload *event.Payload
+	if e.documents != nil {
+		doc, err := documentPayload(ctx, e.documents, DocumentTarget{WorkflowID: params.WorkflowID, RunID: params.RunID,
+			NodeID: params.NodeID, Direction: DirectionInput}, params.Input)
+		if err == nil {
+			payload = doc
+		} else {
+			e.logger.Warn("node input document not written, sending the input the old way",
+				zap.String("node_id", params.NodeID), zap.Error(err))
+		}
+	}
+	var prepErr error
+	if payload == nil {
+		payload, prepErr = PreparePayload(ctx, params.Input, pathCtx, e.uploader, nil)
+		if payload != nil && prepErr == nil {
+			payload.Files = ScanFiles(params.Input, DirectionInput)
+		}
+	}
 	if prepErr != nil {
 		e.logger.Warn("PreparePayload failed for node.started input payload, using inline fallback",
 			zap.String("node_id", params.NodeID),
