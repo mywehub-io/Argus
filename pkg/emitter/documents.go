@@ -26,7 +26,7 @@ type DocumentTarget struct {
 
 // DocumentWriter writes a node's input or output document into the run's own files and returns
 // its reference (raw payloads D9). With one set, the lifecycle emitters send that reference
-// instead of uploading a monitoring copy or sending the payload inline.
+// instead of a copy of the payload.
 type DocumentWriter interface {
 	WriteDocument(ctx context.Context, target DocumentTarget, data []byte) (event.FileRef, error)
 }
@@ -101,7 +101,7 @@ func escapePointer(k string) string {
 }
 
 // documentPayload writes data as the node's document and returns the payload that points at it,
-// with the files found in it. On an error the caller takes the inline or uploaded path instead.
+// with the files found in it.
 func documentPayload(ctx context.Context, w DocumentWriter, target DocumentTarget, data []byte) (*event.Payload, error) {
 	ref, err := w.WriteDocument(ctx, target, data)
 	if err != nil {

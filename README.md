@@ -237,7 +237,7 @@ evt := event.New(event.TypeNodeStarted).
         Label:          "HTTP Request Node",
         StartedAt:      time.Now().UnixMilli(),
         Input: &event.Payload{
-            InlineData: []byte(`{"url":"https://example.com"}`),
+            Document: &event.FileRef{Path: "results/wf_abc/run_xyz/node_1/input.json", Size: 29},
         },
     })
 

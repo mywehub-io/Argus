@@ -1,116 +1,52 @@
 # pkg/emitter
 
-Payload preparation helpers and high-level emitters for Argus node lifecycle events.
+High-level emitters for Argus node lifecycle events.
 
 ## Purpose
 
-`emitter` sits between your business logic and `pkg/observer`. It decides whether a node
-output or input goes inline or to blob storage, builds the monitoring blob path, and wraps
-the full emit-a-node-event flow into two concrete types: `ArgusNodeEndEmitter` and
-`ArgusNodeStartEmitter`.
+`emitter` sits between your business logic and `pkg/observer`. It writes a node's input or output
+as a document in the run's own files, sends the document's reference, and wraps the full
+emit-a-node-event flow into two concrete types: `ArgusNodeEndEmitter` and
+`ArgusNodeStartEmitter`. An event never carries the payload itself: monitoring reads the document
+from the run's files.
 
-## `PreparePayload`
-
-```go
-func PreparePayload(
-    ctx     context.Context,
-    data    []byte,
-    pathCtx PathContext,
-    uploader BlobUploader,
-    opts    *PayloadOptions,
-) (*event.Payload, error)
-```
-
-Applies the size threshold and returns either inline data or a blob reference.
-
-| Condition | Result |
-|---|---|
-| `data` is empty | `nil, nil` |
-| `len(data) <= MaxInlineBytes` or `uploader == nil` | `Payload{InlineData: data}` |
-| `len(data) > MaxInlineBytes` and upload succeeds | `Payload{BlobReference: &BlobReference{URL, Size}}` |
-| Upload fails | `Payload{InlineData: data}, error` — caller may log and continue |
-
-`PathContext.IsInput` controls the blob path suffix: output paths end with `{node_id}.json`;
-input paths end with `{node_id}-input.json`.
-
-(`pkg/emitter/emitter.go:55`)
-
-## `PathContext`
+## `DocumentWriter`
 
 ```go
-type PathContext struct {
-    ClientID   string
-    ProjectID  string
+type DocumentWriter interface {
+    WriteDocument(ctx context.Context, target DocumentTarget, data []byte) (event.FileRef, error)
+}
+
+type DocumentTarget struct {
     WorkflowID string
     RunID      string
     NodeID     string
-    IsInput    bool  // true → input path suffix; false → output path suffix
+    Direction  string // DirectionInput or DirectionOutput
 }
 ```
 
-All five ID fields are required. If any is empty, `BuildMonitoringPath` returns `""` and
-`PreparePayload` returns an inline payload with an error.
+The producer implements `DocumentWriter` over its own blob store and returns the reference of the
+file it wrote (Elysium writes `results/{workflow}/{run}/{node}/input.json` and `output.json`).
+(`pkg/emitter/documents.go`)
 
-## `PayloadOptions`
-
-```go
-type PayloadOptions struct {
-    MaxInlineBytes int  // 0 means DefaultMaxInlineBytes (512 000 bytes = 500 KB)
-}
-```
-
-Pass `nil` to use the default threshold.
-
-## `DefaultMaxInlineBytes`
+## `ScanFiles`
 
 ```go
-const DefaultMaxInlineBytes = 512000
+func ScanFiles(data []byte, direction string) []event.PortFile
 ```
 
-500 KB. Matches the thresholds used by Athena and Icarus resolver. (`pkg/emitter/emitter.go:36`)
-
-## Blob path format
-
-```
-monitoring/{client_id}/{project_id}/{workflow_id}/{run_id}/{node_id}.json        (output)
-monitoring/{client_id}/{project_id}/{workflow_id}/{run_id}/{node_id}-input.json  (input)
-monitoring/{client_id}/{project_id}/{workflow_id}/{run_id}/{node_id}.csv         (CSV produce)
-monitoring/{client_id}/{project_id}/{workflow_id}/{run_id}/{node_id}.xlsx        (XLSX produce)
-```
-
-(`pkg/emitter/producer_blob.go:18`)
-
-## `BlobUploader` interface
-
-```go
-type BlobUploader interface {
-    Upload(ctx context.Context, path string, data []byte, metadata map[string]string) (url string, size int64, err error)
-}
-```
-
-Inject a custom implementation or use `AzureBlobUploader`. Passing `nil` forces inline storage
-for all payloads regardless of size.
-
-## `AzureBlobUploader`
-
-```go
-func NewAzureBlobUploader(connectionString, containerName string, logger *zap.Logger) (*AzureBlobUploader, error)
-```
-
-Creates a shared-key credential Azure Blob Storage client. Supports HTTP endpoints (Azurite)
-for local development — detected automatically when the service URL starts with `http://`.
-
-The container is created lazily on the first `Upload` call; if it already exists the error is
-swallowed. (`pkg/emitter/azure_blob.go:108`)
+Returns every file reference (`{"$file":{...}}`, alone or as an item of a files list) in a JSON
+document, keyed by its JSON pointer. The emitters attach the result to the payload as `Files`, so
+a consumer can list a node's files without reading the document.
 
 ## `ArgusNodeEndEmitter`
 
-High-level wrapper that marshals the output, decides inline vs blob (with special handling for
-CSV/XLSX produce artifacts), builds the `node.ended` event, and calls `observer.Emit`.
-
 ```go
-func NewArgusNodeEndEmitter(obs observer.Observer, uploader BlobUploader, logger *zap.Logger) *ArgusNodeEndEmitter
+func NewArgusNodeEndEmitter(obs observer.Observer, documents DocumentWriter, logger *zap.Logger) *ArgusNodeEndEmitter
 ```
+
+Marshals the output, writes it as the node's output document, builds the `node.ended` event and
+calls `observer.Emit`.
 
 ```go
 type NodeEndEmitParams struct {
@@ -127,21 +63,17 @@ type NodeEndEmitParams struct {
 }
 ```
 
-**CSV/XLSX produce artifact handling:** when the marshaled output is a JSON object with
-`action: "produce"`, `fileExtension: ".csv"` or `".xlsx"`, and a valid base64 `encoded` field,
-the raw decoded bytes are uploaded directly to a `.csv` or `.xlsx` blob path — bypassing the
-500 KB threshold — so monitoring downloads are native files, not JSON wrappers. Falls back to
-`PreparePayload` if the uploader is `nil` or the upload fails. (`pkg/emitter/emitter.go:168`)
-
-**Nil-safe:** calling `EmitNodeEnd` on a nil receiver or with a nil observer is a no-op.
+**Best effort:** if the document cannot be written the event is still sent, with an empty
+`Payload`, so the end of the node is not lost to monitoring. A nil receiver, a nil observer or a
+nil writer is a no-op.
 
 **Required fields:** `ClientID`, `WorkflowID`, `RunID`, `NodeID` must all be non-empty. Empty
-required fields skip emission silently (DEBUG log). (`pkg/emitter/emitter.go:172`)
+required fields skip emission silently (DEBUG log).
 
 ## `ArgusNodeStartEmitter`
 
 ```go
-func NewArgusNodeStartEmitter(obs observer.Observer, uploader BlobUploader, logger *zap.Logger) *ArgusNodeStartEmitter
+func NewArgusNodeStartEmitter(obs observer.Observer, documents DocumentWriter, logger *zap.Logger) *ArgusNodeStartEmitter
 ```
 
 ```go
@@ -156,19 +88,15 @@ type NodeStartEmitParams struct {
 }
 ```
 
-Calls `PreparePayload` on the resolved input, then emits a `node.started` event. No special
-produce handling — input is always treated as opaque bytes. Empty `Label` defaults to `NodeID`.
-(`pkg/emitter/emitter.go:349`)
+Writes the resolved input as the node's input document and emits a `node.started` event. Empty
+`Label` defaults to `NodeID`.
 
 ## Typical usage
 
 ```go
-uploader, err := emitter.NewAzureBlobUploader(connStr, "monitoring", logger)
-if err != nil { ... }
+nodeEndEmitter := emitter.NewArgusNodeEndEmitter(obs, myDocumentWriter, logger)
 
-nodeEndEmitter := emitter.NewArgusNodeEndEmitter(obs, uploader, logger)
-
-err = nodeEndEmitter.EmitNodeEnd(ctx, emitter.NodeEndEmitParams{
+err := nodeEndEmitter.EmitNodeEnd(ctx, emitter.NodeEndEmitParams{
     ClientID:   "org_123",
     ProjectID:  "proj_abc",
     WorkflowID: "wf_xyz",
@@ -183,6 +111,6 @@ err = nodeEndEmitter.EmitNodeEnd(ctx, emitter.NodeEndEmitParams{
 
 ## See also
 
-- [pkg/event](../event/README.md) — `Payload`, `BlobReference`, event type constants
+- [pkg/event](../event/README.md) — `Payload`, `FileRef`, event type constants
 - [pkg/observer](../observer/README.md) — how to emit events over NATS
 - [Argus README](../../README.md) — architecture overview

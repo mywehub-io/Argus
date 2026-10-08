@@ -38,7 +38,7 @@ const fileOut = `{"rows":2,"encoded":{"$file":{"path":"results/w/r/n/encoded.csv
 func TestNodeEndSendsTheDocument(t *testing.T) {
 	obs := &captureObserver{}
 	w := &fakeWriter{}
-	em := NewArgusNodeEndEmitter(obs, nil, nil).WithDocuments(w)
+	em := NewArgusNodeEndEmitter(obs, w, nil)
 	var out interface{}
 	_ = json.Unmarshal([]byte(fileOut), &out)
 	if err := em.EmitNodeEnd(context.Background(), NodeEndEmitParams{ClientID: "c", WorkflowID: "w", RunID: "r", NodeID: "n", Output: out}); err != nil {
@@ -49,7 +49,7 @@ func TestNodeEndSendsTheDocument(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := end.Output
-	if p == nil || p.Document == nil || p.Document.Path != "results/w/r/n/output.json" || len(p.InlineData) != 0 || p.BlobReference != nil {
+	if p == nil || p.Document == nil || p.Document.Path != "results/w/r/n/output.json" {
 		t.Fatalf("want only a document reference: %+v", p)
 	}
 	if len(p.Files) != 2 {
@@ -70,7 +70,7 @@ func TestNodeEndSendsTheDocument(t *testing.T) {
 func TestNodeStartSendsTheDocument(t *testing.T) {
 	obs := &captureObserver{}
 	w := &fakeWriter{}
-	em := NewArgusNodeStartEmitter(obs, nil, nil).WithDocuments(w)
+	em := NewArgusNodeStartEmitter(obs, w, nil)
 	in := []byte(`{"data":{"$file":{"path":"results/w/r/trigger/payload.csv","size":5}}}`)
 	if err := em.EmitNodeStart(context.Background(), NodeStartEmitParams{ClientID: "c", WorkflowID: "w", RunID: "r", NodeID: "n", Input: in}); err != nil {
 		t.Fatal(err)
@@ -85,18 +85,18 @@ func TestNodeStartSendsTheDocument(t *testing.T) {
 	}
 }
 
-// A failed write falls back to the inline payload, still listing the files.
-func TestDocumentWriteFailureFallsBack(t *testing.T) {
+// A failed write still sends the event, with no document: the node's start is not lost.
+func TestDocumentWriteFailureStillSendsTheEvent(t *testing.T) {
 	obs := &captureObserver{}
-	em := NewArgusNodeStartEmitter(obs, nil, nil).WithDocuments(&fakeWriter{err: errors.New("store down")})
+	em := NewArgusNodeStartEmitter(obs, &fakeWriter{err: errors.New("store down")}, nil)
 	in := []byte(`{"data":{"$file":{"path":"results/w/r/trigger/payload.csv","size":5}}}`)
 	if err := em.EmitNodeStart(context.Background(), NodeStartEmitParams{ClientID: "c", WorkflowID: "w", RunID: "r", NodeID: "n", Input: in}); err != nil {
 		t.Fatal(err)
 	}
 	var start event.StartNode
 	_ = json.Unmarshal(obs.events[0].Data, &start)
-	if start.Input == nil || start.Input.Document != nil || len(start.Input.InlineData) == 0 || len(start.Input.Files) != 1 {
-		t.Fatalf("want the inline fallback with files: %+v", start.Input)
+	if len(obs.events) != 1 || start.Input == nil || start.Input.Document != nil || len(start.Input.Files) != 0 {
+		t.Fatalf("want the event with an empty input payload: %+v", start.Input)
 	}
 }
 

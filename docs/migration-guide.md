@@ -44,7 +44,7 @@ consumers that have already migrated will simply not receive them.
 emitter := pkg.NewNodeEndEmitter(obs, uploader, logger)
 
 // After
-emitter := emitter.NewArgusNodeEndEmitter(obs, uploader, logger)
+emitter := emitter.NewArgusNodeEndEmitter(obs, uploader, logger) // v0.3; from the raw payloads release the second argument is an emitter.DocumentWriter
 ```
 
 If you typed the variable as the interface, the change is limited to the constructor call.
@@ -52,17 +52,9 @@ If you typed the variable as the interface, the change is limited to the constru
 ### 3. `ProjectID` is now required in all node payloads
 
 `StartNode`, `EndNode`, `RunStartedData`, and `RunEndedData` now carry a `ProjectID string`
-field. Argus uses this for multi-tenant blob path isolation:
+field, used for multi-tenant isolation.
 
-```
-monitoring/{client_id}/{project_id}/{workflow_id}/{run_id}/{node_id}.json
-```
-
-**Producers:** populate `ProjectID` in `NodeEndEmitParams` and `NodeStartEmitParams`. If
-`ProjectID` is empty the blob path cannot be built and the payload falls back to inline,
-logging an error.
-
-**Consumers:** update any monitoring path reconstruction logic to include the project segment.
+**Producers:** populate `ProjectID` in `NodeEndEmitParams` and `NodeStartEmitParams`.
 
 ---
 

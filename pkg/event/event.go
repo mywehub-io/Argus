@@ -366,28 +366,12 @@ type EndNode struct {
 	ProjectID      string              `json:"project_id,omitempty"`      // For blob path and multi-tenant isolation
 	ContainsNodes  []string            `json:"contains_nodes,omitempty"`  // Node IDs whose outputs are in this unit result (parent + embedded)
 	ExecutionID    string              `json:"execution_id,omitempty"`    // Execution ID of the unit that produced this result
-	ConsumerInputs map[string]*Payload `json:"consumer_inputs,omitempty"` // consumerNodeID -> pre-built input (inline or blob) from Elysium
-}
-
-// BlobRef represents a blob reference for observation payloads (used by plugin events).
-type BlobRef struct {
-	URL       string `json:"url"`
-	SizeBytes int64  `json:"size_bytes"`
-}
-
-// PayloadInfo represents inline or blob payloads for plugin lifecycle events.
-// InlineData is raw JSON so UIs can display it without base64 decoding.
-type PayloadInfo struct {
-	InlineData    json.RawMessage `json:"inline_data,omitempty"`
-	BlobReference *BlobRef        `json:"blob_reference,omitempty"`
 }
 
 type Payload struct {
-	InlineData    []byte         `json:"inline_data"`
-	BlobReference *BlobReference `json:"blob_reference"`
 	// Document is the node's input or output document in the run's files
-	// (results/{wf}/{run}/{nodeId}.input.json or .output.json), written once by the producer; monitoring reads it there instead of a
-	// copy (raw payloads D9). When set, InlineData and BlobReference are empty.
+	// (results/{wf}/{run}/{nodeId}.input.json or .output.json), written once by the producer; monitoring reads it there
+	// (raw payloads D9). Empty when the document could not be written.
 	Document *FileRef `json:"document,omitempty"`
 	// Files lists every file reference inside the document, with its port key and direction.
 	Files []PortFile `json:"files,omitempty"`
@@ -412,7 +396,3 @@ type PortFile struct {
 	File      FileRef `json:"file"`
 }
 
-type BlobReference struct {
-	URL  string `json:"url"`
-	Size int64  `json:"size"`
-}
