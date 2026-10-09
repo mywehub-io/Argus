@@ -13,6 +13,19 @@ Each entry is tagged `` `public:` `` or `` `internal:` ``:
 
 ## [Unreleased]
 
+### Breaking: payloads are references (raw payloads hard cut)
+
+- `public:` `event.Payload` carries `Document` and `Files` only. `InlineData`, `BlobReference`
+  (field and type), `BlobRef`, `PayloadInfo` and `EndNode.ConsumerInputs` are removed. A consumer
+  that reads events published before the release has to decode the old fields itself.
+- `public:` `pkg/emitter`: `PreparePayload`, `PayloadOptions`, `DefaultMaxInlineBytes`,
+  `PathContext`, `BuildMonitoringPath` and `BuildMonitoringPathWithSuffix`, `BlobUploader`,
+  `AzureBlobUploader`, the CSV and XLSX produce blob special case and `WithDocuments` are removed.
+  `NewArgusNodeEndEmitter` and `NewArgusNodeStartEmitter` take an `emitter.DocumentWriter` as
+  their second argument and write the node's document through it. If the document cannot be
+  written the event is still sent with an empty payload.
+- `internal:` The module no longer depends on the Azure storage SDK.
+
 ## [0.4.1] — 2026-05-10
 
 ### Added

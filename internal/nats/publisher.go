@@ -20,6 +20,7 @@ type PublisherConfig struct {
 	StreamName     string
 	StreamMaxAge   time.Duration
 	StreamMaxMsgs  int64
+	StreamMaxBytes int64
 	PublishTimeout time.Duration
 }
 
@@ -47,7 +48,8 @@ func NewPublisher(js nats.JetStreamContext, config PublisherConfig, logger *zap.
 	return p, nil
 }
 
-// ensureStream creates the observation stream if it does not already exist.
+// ensureStream creates the observation stream if it does not already exist, and brings an
+// existing one to the configured size cap (it used to be left as created, with no cap at all).
 func (p *Publisher) ensureStream() error {
 	streamInfo, err := p.js.StreamInfo(p.config.StreamName)
 	if err != nil && err != nats.ErrStreamNotFound {
@@ -58,7 +60,7 @@ func (p *Publisher) ensureStream() error {
 		p.logger.Info("Observation stream already exists",
 			zap.String("stream", p.config.StreamName),
 			zap.Uint64("messages", streamInfo.State.Msgs))
-		return nil
+		return p.ensureSizeCap(streamInfo.Config)
 	}
 
 	streamConfig := &nats.StreamConfig{
@@ -67,6 +69,10 @@ func (p *Publisher) ensureStream() error {
 		Storage:  nats.FileStorage,
 		MaxAge:   p.config.StreamMaxAge,
 		MaxMsgs:  p.config.StreamMaxMsgs,
+		MaxBytes: p.config.StreamMaxBytes,
+		// Above a limit the oldest events go: events are kept by limits, not removed on ack, so
+		// refusing new ones would stop monitoring once the stream filled.
+		Discard:  nats.DiscardOld,
 		Replicas: 1,
 	}
 	if _, err := p.js.AddStream(streamConfig); err != nil {
@@ -77,7 +83,27 @@ func (p *Publisher) ensureStream() error {
 		zap.String("stream", p.config.StreamName),
 		zap.Strings("subjects", streamConfig.Subjects),
 		zap.Duration("max_age", streamConfig.MaxAge),
-		zap.Int64("max_msgs", streamConfig.MaxMsgs))
+		zap.Int64("max_msgs", streamConfig.MaxMsgs),
+		zap.Int64("max_bytes", streamConfig.MaxBytes))
+	return nil
+}
+
+// ensureSizeCap updates an existing stream whose size cap differs from the configured one. Only
+// MaxBytes and Discard change. Lowering the cap below the stream's size drops its oldest events.
+func (p *Publisher) ensureSizeCap(cfg nats.StreamConfig) error {
+	if p.config.StreamMaxBytes <= 0 || (cfg.MaxBytes == p.config.StreamMaxBytes && cfg.Discard == nats.DiscardOld) {
+		return nil
+	}
+	previous := cfg.MaxBytes
+	cfg.MaxBytes = p.config.StreamMaxBytes
+	cfg.Discard = nats.DiscardOld
+	if _, err := p.js.UpdateStream(&cfg); err != nil {
+		return fmt.Errorf("failed to set the observation stream's size cap: %w", err)
+	}
+	p.logger.Info("Updated the observation stream's size cap",
+		zap.String("stream", p.config.StreamName),
+		zap.Int64("from", previous),
+		zap.Int64("to", cfg.MaxBytes))
 	return nil
 }
 

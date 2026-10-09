@@ -3,8 +3,6 @@ module github.com/wehubfusion/Argus
 go 1.25.5
 
 require (
-	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.19.1
-	github.com/Azure/azure-sdk-for-go/sdk/storage/azblob v1.6.3
 	github.com/google/uuid v1.6.0
 	github.com/nats-io/nats.go v1.46.1
 	go.opentelemetry.io/otel v1.45.0
@@ -13,7 +11,6 @@ require (
 )
 
 require (
-	github.com/Azure/azure-sdk-for-go/sdk/internal v1.11.2 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
@@ -24,7 +21,5 @@ require (
 	go.opentelemetry.io/otel/metric v1.45.0 // indirect
 	go.uber.org/multierr v1.10.0 // indirect
 	golang.org/x/crypto v0.41.0 // indirect
-	golang.org/x/net v0.43.0 // indirect
 	golang.org/x/sys v0.35.0 // indirect
-	golang.org/x/text v0.28.0 // indirect
 )

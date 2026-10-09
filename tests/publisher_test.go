@@ -334,3 +334,37 @@ func TestPublisher_EnsureStream_UsesExistingStream(t *testing.T) {
 		t.Fatal("Expected stream to still exist")
 	}
 }
+
+// The observation stream gets a size cap that drops its oldest events: a new stream is created
+// with it, an existing stream without it is updated once, and a stream already capped is left
+// alone (UAT incident 08/10/2026, C2).
+func TestPublisherCapsTheStreamSize(t *testing.T) {
+	logger := zap.NewNop()
+	config := nats.PublisherConfig{StreamName: "OBS", StreamMaxAge: time.Hour, StreamMaxMsgs: 10, StreamMaxBytes: 4 << 30, PublishTimeout: time.Second}
+
+	fresh := NewMockJetStream()
+	if _, err := nats.NewPublisher(fresh, config, logger); err != nil {
+		t.Fatal(err)
+	}
+	if cfg := fresh.GetStreams()["OBS"].Config; cfg.MaxBytes != 4<<30 || cfg.Discard != natsclient.DiscardOld {
+		t.Fatalf("new stream: max_bytes %d discard %v", cfg.MaxBytes, cfg.Discard)
+	}
+
+	old := NewMockJetStream()
+	if _, err := old.AddStream(&natsclient.StreamConfig{Name: "OBS", Subjects: []string{"OBSERVE.>"}, MaxAge: 30 * 24 * time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := nats.NewPublisher(old, config, logger); err != nil {
+		t.Fatal(err)
+	}
+	cfg := old.GetStreams()["OBS"].Config
+	if old.Updates() != 1 || cfg.MaxBytes != 4<<30 || cfg.Discard != natsclient.DiscardOld || cfg.MaxAge != 30*24*time.Hour {
+		t.Fatalf("existing stream: updates %d, max_bytes %d, discard %v, max_age %v (other settings must stay)", old.Updates(), cfg.MaxBytes, cfg.Discard, cfg.MaxAge)
+	}
+	if _, err := nats.NewPublisher(old, config, logger); err != nil {
+		t.Fatal(err)
+	}
+	if old.Updates() != 1 {
+		t.Fatalf("an already capped stream was updated again (%d updates)", old.Updates())
+	}
+}

@@ -118,7 +118,7 @@ type StartNode struct {
     NodeID     string
     Label      string   // Human-readable label from the execution plan
     StartedAt  int64    // Unix ms
-    Input      *Payload // Resolved input (inline or blob reference)
+    Input      *Payload // Resolved input (a reference to its document)
 }
 ```
 
@@ -133,29 +133,40 @@ type EndNode struct {
     Label         string
     StartedAt     int64
     EndedAt       int64    // Unix ms
-    Output        *Payload // Node output (inline or blob reference)
+    Output        *Payload // Node output (a reference to its document)
     HasError      bool
     ErrorMessage  string
     ProjectID     string
     ContainsNodes []string // Node IDs in this execution unit (parent + embedded)
     ExecutionID   string
-    ConsumerInputs map[string]*Payload // per-consumer pre-built inputs from Elysium
 }
 ```
 
-### `Payload` and `BlobReference`
+### `Payload`, `FileRef` and `PortFile`
 
 ```go
 type Payload struct {
-    InlineData    []byte
-    BlobReference *BlobReference // non-nil when payload exceeded the 500 KB threshold
+    Document *FileRef   // the node's input or output document, in the run's files
+    Files    []PortFile // every file reference inside the document
 }
 
-type BlobReference struct {
-    URL  string
-    Size int64
+type FileRef struct {
+    Path        string
+    Size        int64
+    ContentType string
+    FileName    string
+    Records     *int64
+}
+
+type PortFile struct {
+    Key       string  // JSON pointer of the reference in the document
+    Direction string  // "input" or "output"
+    File      FileRef
 }
 ```
+
+A payload never carries data inline. `Document` is empty only when the producer could not write
+the document.
 
 ## NATS contract
 
@@ -186,7 +197,7 @@ evt := event.New(event.TypeNodeEnded).
         NodeID:       "node_1",
         EndedAt:      time.Now().UnixMilli(),
         HasError:     false,
-        Output:       &event.Payload{InlineData: []byte(`{"result": "ok"}`)},
+        Output:       &event.Payload{Document: &event.FileRef{Path: "results/wf_abc/run_xyz/node_1/output.json", Size: 16}},
     })
 ```
 

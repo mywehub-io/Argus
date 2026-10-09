@@ -483,7 +483,7 @@ func TestWithData_StartNode(t *testing.T) {
 		Label:      "HTTP Request",
 		StartedAt:  1704067200000,
 		Input: &event.Payload{
-			InlineData: []byte(`{"url":"https://example.com"}`),
+			Document: &event.FileRef{Path: "results/wf_abc/run_xyz/node_1/input.json", Size: 29},
 		},
 	}
 
@@ -504,7 +504,7 @@ func TestWithData_StartNode(t *testing.T) {
 	if parsed.StartedAt != data.StartedAt {
 		t.Errorf("Expected started_at %d, got %d", data.StartedAt, parsed.StartedAt)
 	}
-	if parsed.Input == nil || string(parsed.Input.InlineData) != string(data.Input.InlineData) {
+	if parsed.Input == nil || parsed.Input.Document == nil || parsed.Input.Document.Path != data.Input.Document.Path {
 		t.Errorf("Expected input payload to match")
 	}
 }
@@ -518,10 +518,7 @@ func TestWithData_EndNode(t *testing.T) {
 		Label:      "HTTP Request",
 		EndedAt:    1704067260000,
 		Output: &event.Payload{
-			BlobReference: &event.BlobReference{
-				URL:  "https://blob.example.com/result.json",
-				Size: 2048,
-			},
+			Document: &event.FileRef{Path: "results/wf_abc/run_xyz/node_1/output.json", Size: 2048},
 		},
 		HasError: false,
 	}
@@ -540,11 +537,11 @@ func TestWithData_EndNode(t *testing.T) {
 	if parsed.EndedAt != data.EndedAt {
 		t.Errorf("Expected ended_at %d, got %d", data.EndedAt, parsed.EndedAt)
 	}
-	if parsed.Output == nil || parsed.Output.BlobReference == nil {
-		t.Fatal("Expected output with blob_reference")
+	if parsed.Output == nil || parsed.Output.Document == nil {
+		t.Fatal("Expected output with a document")
 	}
-	if parsed.Output.BlobReference.URL != data.Output.BlobReference.URL {
-		t.Errorf("Expected blob URL %s, got %s", data.Output.BlobReference.URL, parsed.Output.BlobReference.URL)
+	if parsed.Output.Document.Path != data.Output.Document.Path {
+		t.Errorf("Expected document %s, got %s", data.Output.Document.Path, parsed.Output.Document.Path)
 	}
 }
 

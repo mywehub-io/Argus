@@ -1,6 +1,8 @@
 package event
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -63,12 +65,20 @@ type Event struct {
 	// callers always see the root cause rather than a misleading "missing data"
 	// error. Consumers never see this field; it is a build-time guard for producers.
 	marshalErr error `json:"-"`
+
+	// newID is the ID New generated. While ID still equals it, EmitID derives the ID from the
+	// event's content instead.
+	newID string `json:"-"`
 }
 
-// New creates a new event with generated ID and timestamp.
+// New creates a new event with a generated ID and timestamp. The generated ID is provisional:
+// the observer replaces it with DedupID when it emits the event, so publishing the same event
+// twice is stored once (JetStream Nats-Msg-Id dedup). An ID the caller assigns is kept.
 func New(eventType string) *Event {
+	id := uuid.New().String()
 	return &Event{
-		ID:        uuid.New().String(),
+		ID:        id,
+		newID:     id,
 		Type:      eventType,
 		Version:   "v1",
 		Timestamp: time.Now(),
@@ -145,6 +155,30 @@ func (e *Event) ParseData(dest any) error {
 		return nil
 	}
 	return json.Unmarshal(e.Data, dest)
+}
+
+// DedupID is the event's publish-time deduplication id: a hash of its type, tenant, workflow,
+// run, node and data. Republishing the same event (a producer retry) gives the same id, and
+// JetStream stores it once. Events that differ in any of these, for example a node.ended after a
+// retried unit with a different outcome, get different ids. The timestamp is left out on purpose:
+// a retry stamps a new one.
+func (e *Event) DedupID() string {
+	h := sha256.New()
+	for _, part := range []string{e.Type, e.EnvironmentID, e.ClientID, e.WorkflowID, e.RunID, e.NodeID} {
+		h.Write([]byte(part))
+		h.Write([]byte{0})
+	}
+	h.Write(e.Data)
+	return hex.EncodeToString(h.Sum(nil))[:32]
+}
+
+// EmitID returns the id to publish the event under: DedupID when the ID is empty or still the
+// one New generated, otherwise the ID the caller set.
+func (e *Event) EmitID() string {
+	if e.ID == "" || e.ID == e.newID {
+		return e.DedupID()
+	}
+	return e.ID
 }
 
 // === Validation ===
@@ -332,28 +366,33 @@ type EndNode struct {
 	ProjectID      string              `json:"project_id,omitempty"`      // For blob path and multi-tenant isolation
 	ContainsNodes  []string            `json:"contains_nodes,omitempty"`  // Node IDs whose outputs are in this unit result (parent + embedded)
 	ExecutionID    string              `json:"execution_id,omitempty"`    // Execution ID of the unit that produced this result
-	ConsumerInputs map[string]*Payload `json:"consumer_inputs,omitempty"` // consumerNodeID -> pre-built input (inline or blob) from Elysium
-}
-
-// BlobRef represents a blob reference for observation payloads (used by plugin events).
-type BlobRef struct {
-	URL       string `json:"url"`
-	SizeBytes int64  `json:"size_bytes"`
-}
-
-// PayloadInfo represents inline or blob payloads for plugin lifecycle events.
-// InlineData is raw JSON so UIs can display it without base64 decoding.
-type PayloadInfo struct {
-	InlineData    json.RawMessage `json:"inline_data,omitempty"`
-	BlobReference *BlobRef        `json:"blob_reference,omitempty"`
 }
 
 type Payload struct {
-	InlineData    []byte         `json:"inline_data"`
-	BlobReference *BlobReference `json:"blob_reference"`
+	// Document is the node's input or output document in the run's files
+	// (results/{wf}/{run}/{nodeId}.input.json or .output.json), written once by the producer; monitoring reads it there
+	// (raw payloads D9). Empty when the document could not be written.
+	Document *FileRef `json:"document,omitempty"`
+	// Files lists every file reference inside the document, with its port key and direction.
+	Files []PortFile `json:"files,omitempty"`
 }
 
-type BlobReference struct {
-	URL  string `json:"url"`
-	Size int64  `json:"size"`
+// FileRef is a file in a run's files: the "$file" value raw payloads pass between nodes
+// (Icarus pkg/fileref). Path is relative to the results container.
+type FileRef struct {
+	Path        string `json:"path"`
+	Size        int64  `json:"size"`
+	ContentType string `json:"contentType,omitempty"`
+	FileName    string `json:"fileName,omitempty"`
+	Records     *int64 `json:"records,omitempty"`
 }
+
+// PortFile is one file reference found in a node's input or output document.
+type PortFile struct {
+	// Key is where the reference sits in the document, as a JSON pointer ("/payload", "/files/0").
+	Key string `json:"key"`
+	// Direction is "input" or "output".
+	Direction string  `json:"direction"`
+	File      FileRef `json:"file"`
+}
+

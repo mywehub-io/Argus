@@ -65,20 +65,20 @@ json.Unmarshal(msgs[0].Data, &captured)
 
 `ClearPublishedMessages()` resets the captured slice between sub-tests.
 
-## Testing `ArgusNodeEndEmitter` with a stub uploader
+## Testing `ArgusNodeEndEmitter` with a stub document writer
 
-`BlobUploader` is an interface, so you can inject a stub without Azure credentials:
+`DocumentWriter` is an interface, so you can inject a stub without storage credentials:
 
 ```go
-type stubUploader struct{}
+type stubWriter struct{}
 
-func (s *stubUploader) Upload(_ context.Context, path string, data []byte, _ map[string]string) (string, int64, error) {
-    return "https://stub/" + path, int64(len(data)), nil
+func (s *stubWriter) WriteDocument(_ context.Context, t emitter.DocumentTarget, data []byte) (event.FileRef, error) {
+    return event.FileRef{Path: "results/" + t.WorkflowID + "/" + t.RunID + "/" + t.NodeID + "/" + t.Direction + ".json", Size: int64(len(data))}, nil
 }
 
 js := tests.NewMockJetStream()
 obs, _ := observer.NewObserver(js, observer.DefaultOptions(), zap.NewNop())
-e := emitter.NewArgusNodeEndEmitter(obs, &stubUploader{}, zap.NewNop())
+e := emitter.NewArgusNodeEndEmitter(obs, &stubWriter{}, zap.NewNop())
 
 err := e.EmitNodeEnd(ctx, emitter.NodeEndEmitParams{
     ClientID:   "org_1",
@@ -90,27 +90,8 @@ err := e.EmitNodeEnd(ctx, emitter.NodeEndEmitParams{
 })
 ```
 
-To force blob upload, pass a large output: generate a byte slice larger than
-`emitter.DefaultMaxInlineBytes` (512 000 bytes).
-
-## Testing with Azurite (local Azure Blob Storage)
-
-For integration tests that exercise `AzureBlobUploader`:
-
-```bash
-docker run -p 10000:10000 mcr.microsoft.com/azure-storage/azurite azurite-blob --blobHost 0.0.0.0
-```
-
-```go
-connStr := "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;" +
-    "AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KbiE9mZbM9w==;" +
-    "BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1"
-
-uploader, err := emitter.NewAzureBlobUploader(connStr, "monitoring", zap.NewNop())
-```
-
-The `AzureBlobUploader` detects the `http://` prefix and enables
-`InsecureAllowCredentialWithHTTP` automatically. (`pkg/emitter/azure_blob.go:56`)
+To exercise the failure path, return an error from the stub: the event is still sent, with an
+empty payload.
 
 ## Testing with a real NATS server
 

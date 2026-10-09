@@ -5,8 +5,10 @@ Synchronous, thread-safe wrapper over NATS JetStream for emitting Argus observat
 ## Purpose
 
 `observer` turns a raw NATS JetStream context into a safe, reusable interface for emitting
-[Argus events](../event/README.md). Every `Emit` call publishes synchronously and returns the
-actual delivery result, so callers know immediately whether the event reached the broker.
+[Argus events](../event/README.md). By default every `Emit` call publishes synchronously and
+returns the actual delivery result, so callers know immediately whether the event reached the
+broker. In async mode (`WithAsync`) `Emit` queues the event and returns at once, so a slow
+OBSERVATION stream never slows the caller.
 
 ## Quick start
 
@@ -44,7 +46,15 @@ Validates the event, serializes it to JSON, and publishes it to the NATS subject
 corresponds to `evt.Type` (via `event.SubjectForEventType`). Returns synchronously with the
 delivery result.
 
-Auto-populates `ID`, `Timestamp`, and `Version` if absent.
+Auto-populates `Timestamp` and `Version` if absent. The publish id (`Nats-Msg-Id`) is
+`evt.EmitID()`: `evt.DedupID()`, a hash of the type, tenant, workflow, run, node and data, unless
+the caller set `ID` itself (the ID `event.New` generates does not count). Publishing the same event
+twice is therefore stored once, while a retried unit's `node.ended` with a different outcome is a
+different event (`pkg/event/event.go`).
+
+In async mode `Emit` returns `nil` once the event is validated, serialised and queued. A full queue
+drops the event; drops and publish failures are counted (`observer.StatsOf`) and logged as
+`Argus observation events lost` at most once per `DropLogInterval` (`pkg/observer/async.go`).
 
 Error return values:
 
@@ -58,8 +68,10 @@ Error return values:
 
 ### `Close(ctx)`
 
-Marks the observer as closed. Subsequent `Emit` calls return `ErrObserverClosed`. Safe to
-call multiple times — idempotent via `sync.Once`. (`pkg/observer/observer.go:148`)
+Marks the observer as closed. Subsequent `Emit` calls return `ErrObserverClosed`. In async mode it
+then waits for queued events to be published, until `ctx` ends or, when `ctx` has no deadline,
+`CloseFlushTimeout`, and returns the context error if events were left. Safe to call multiple
+times — idempotent via `sync.Once`.
 
 ## `NewObserver`
 
@@ -89,6 +101,10 @@ All fields have defaults; call `DefaultOptions()` to start.
 | `StreamMaxAge` | 30 days | How long the stream retains messages |
 | `StreamMaxMsgs` | 1 000 000 | Maximum messages stored in the stream |
 | `PublishTimeout` | 5 s | Context deadline added to each NATS publish call |
+| `AsyncQueueSize` | 0 (sync) | Above 0, async mode with a queue of this many events (`WithAsync`) |
+| `AsyncWorkers` | 4 | Goroutines publishing queued events. Events can reach the stream out of order |
+| `DropLogInterval` | 30 s | Least time between two "events lost" log lines |
+| `CloseFlushTimeout` | 5 s | How long `Close` waits for the queue when `ctx` has no deadline |
 
 (`pkg/observer/options.go`)
 
