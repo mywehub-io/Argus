@@ -639,3 +639,39 @@ func TestDataSchema_RoundTripSerialization(t *testing.T) {
 		t.Errorf("Expected trigger_info.data_size %d, got %d", data.TriggerInfo.DataSize, parsed.TriggerInfo.DataSize)
 	}
 }
+
+// A connector step's identifiers sit flat on node.started and node.ended, and the inside of an
+// action carries its scope and hidden flag on node.triggered (Olympus workplans/connector D16,
+// E7-S01). Every one is omitted for an ordinary node, so existing events are byte-identical.
+func TestConnectorFieldsOnNodeEvents(t *testing.T) {
+	end := event.EndNode{NodeID: "s", ConnectorStep: event.ConnectorStep{ConnectorProjectID: "p", ActionKey: "lookup",
+		VersionID: "v", Tag: "1.0.0", Mode: "sync"}}
+	b, err := json.Marshal(end)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var flat map[string]interface{}
+	if err := json.Unmarshal(b, &flat); err != nil {
+		t.Fatal(err)
+	}
+	for k, want := range map[string]string{"connector_project_id": "p", "action_key": "lookup", "version_id": "v", "tag": "1.0.0", "mode": "sync"} {
+		if flat[k] != want {
+			t.Errorf("%s = %v, want %q", k, flat[k], want)
+		}
+	}
+
+	plain, _ := json.Marshal(event.EndNode{NodeID: "n"})
+	for _, k := range []string{"connector_project_id", "action_key", "version_id", "tag", "mode"} {
+		if strings.Contains(string(plain), k) {
+			t.Errorf("an ordinary node.ended carries %s: %s", k, plain)
+		}
+	}
+
+	trig, _ := json.Marshal(event.TriggerNode{NodeID: "i", ScopeNodeID: "s", Hidden: true})
+	if !strings.Contains(string(trig), `"scope_node_id":"s"`) || !strings.Contains(string(trig), `"hidden":true`) {
+		t.Errorf("node.triggered lost its scope: %s", trig)
+	}
+	if plain, _ := json.Marshal(event.TriggerNode{NodeID: "n"}); strings.Contains(string(plain), "hidden") || strings.Contains(string(plain), "scope_node_id") {
+		t.Errorf("an ordinary node.triggered carries scope fields: %s", plain)
+	}
+}
