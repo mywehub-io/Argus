@@ -2,8 +2,13 @@ package nats
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -30,6 +35,25 @@ type Publisher struct {
 	js     nats.JetStreamContext
 	config PublisherConfig
 	logger *zap.Logger
+
+	// ensureMu serialises recreating a lost stream; lastEnsure rate-limits it, so a burst of
+	// publishes against a missing stream makes one attempt, not one each.
+	ensureMu   sync.Mutex
+	lastEnsure time.Time
+	lastOK     bool
+}
+
+// recreateInterval is the least time between two attempts to recreate a lost stream.
+const recreateInterval = 5 * time.Second
+
+// streamReplicas is the replica count for a stream this publisher creates: NATS_STREAM_REPLICAS
+// when set (3 on a three-node cluster, so the stream survives losing a node), else 1. It matches
+// the other platform streams (Icarus message.StreamReplicas).
+func streamReplicas() int {
+	if n, err := strconv.Atoi(strings.TrimSpace(os.Getenv("NATS_STREAM_REPLICAS"))); err == nil && n > 0 {
+		return n
+	}
+	return 1
 }
 
 // NewPublisher creates a new Publisher and ensures the target stream exists.
@@ -73,7 +97,7 @@ func (p *Publisher) ensureStream() error {
 		// Above a limit the oldest events go: events are kept by limits, not removed on ack, so
 		// refusing new ones would stop monitoring once the stream filled.
 		Discard:  nats.DiscardOld,
-		Replicas: 1,
+		Replicas: streamReplicas(),
 	}
 	if _, err := p.js.AddStream(streamConfig); err != nil {
 		return fmt.Errorf("failed to create observation stream: %w", err)
@@ -161,6 +185,13 @@ func (p *Publisher) Publish(ctx context.Context, subject, msgID string, data []b
 		nats.MsgId(msgID),
 		nats.Context(publishCtx),
 	)
+	if streamGone(err) && p.recreateStream() {
+		// The same message ID, so a first attempt that did land is deduplicated.
+		ack, err = p.js.PublishMsg(msg,
+			nats.MsgId(msgID),
+			nats.Context(publishCtx),
+		)
+	}
 	if err != nil {
 		return fmt.Errorf("publisher: publish failed: %w", err)
 	}
@@ -172,4 +203,35 @@ func (p *Publisher) Publish(ctx context.Context, subject, msgID string, data []b
 		zap.Uint64("sequence", ack.Sequence))
 
 	return nil
+}
+
+// streamGone reports whether a publish failed because no stream takes its subject: the stream
+// was deleted, or the server lost its store. Nothing else recreates the stream (NewPublisher
+// ensures it once, at start), so until the service restarted every event was refused.
+func streamGone(err error) bool {
+	return errors.Is(err, nats.ErrNoStreamResponse) ||
+		errors.Is(err, nats.ErrNoResponders) ||
+		errors.Is(err, nats.ErrStreamNotFound)
+}
+
+// recreateStream ensures the stream again, at most once per recreateInterval, and reports
+// whether it now exists (within the interval, whether the last attempt made it exist). While
+// JetStream itself is unavailable the check fails and the publish keeps its original error.
+func (p *Publisher) recreateStream() bool {
+	p.ensureMu.Lock()
+	defer p.ensureMu.Unlock()
+	if time.Since(p.lastEnsure) < recreateInterval {
+		return p.lastOK
+	}
+	p.lastEnsure = time.Now()
+	err := p.ensureStream()
+	p.lastOK = err == nil
+	if err != nil {
+		p.logger.Warn("Observation stream is missing and could not be recreated",
+			zap.String("stream", p.config.StreamName), zap.Error(err))
+		return false
+	}
+	p.logger.Warn("Observation stream was missing; ensured it again",
+		zap.String("stream", p.config.StreamName))
+	return true
 }

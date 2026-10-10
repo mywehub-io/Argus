@@ -21,6 +21,16 @@ type MockJetStream struct {
 	publishedMsgs []PublishedMessage
 	publishErr    error // if non-nil, Publish returns this error
 	updates       int   // UpdateStream calls
+	// requireStream makes Publish behave like the server when no stream exists: the request
+	// has no responders, which the client reports as ErrNoStreamResponse.
+	requireStream bool
+}
+
+// RequireStream makes Publish fail with ErrNoStreamResponse while no stream exists.
+func (m *MockJetStream) RequireStream() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.requireStream = true
 }
 
 // SetPublishError configures the mock to return err from future Publish calls.
@@ -96,6 +106,9 @@ func (m *MockJetStream) Publish(subject string, data []byte, opts ...nats.PubOpt
 
 	if m.publishErr != nil {
 		return nil, m.publishErr
+	}
+	if m.requireStream && len(m.streams) == 0 {
+		return nil, nats.ErrNoStreamResponse
 	}
 
 	// Extract MsgId from options using reflection
