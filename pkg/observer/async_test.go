@@ -78,9 +78,10 @@ func TestAsyncFullQueueDrops(t *testing.T) {
 		_ = o.Emit(context.Background(), nodeEvent(string(rune('a'+i))))
 	}
 	st := StatsOf(o)
-	// One event is held by the worker, two wait in the queue, the rest are dropped.
-	if st.Dropped < 6 || st.Dropped > 7 {
-		t.Fatalf("dropped %d, want 6 or 7", st.Dropped)
+	// Two wait in the queue and the rest are dropped, less the one the worker holds if it took
+	// one before the burst ended: it often has not, so 8 is as right as 7 (this failed most runs).
+	if st.Dropped < 6 || st.Dropped > 8 {
+		t.Fatalf("dropped %d, want 6 to 8", st.Dropped)
 	}
 	close(p.gate)
 	_ = o.Close(context.Background())

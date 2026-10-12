@@ -2,6 +2,7 @@ package tests
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -366,5 +367,62 @@ func TestPublisherCapsTheStreamSize(t *testing.T) {
 	}
 	if old.Updates() != 1 {
 		t.Fatalf("an already capped stream was updated again (%d updates)", old.Updates())
+	}
+}
+
+// A stream lost after start (deleted, or the server's store wiped) is created again by the next
+// publish. It used to be ensured only in NewPublisher, so every event was refused until restart.
+func TestPublisherRecreatesALostStream(t *testing.T) {
+	mockJS := NewMockJetStream()
+	mockJS.RequireStream()
+	pub, err := nats.NewPublisher(mockJS, nats.PublisherConfig{
+		StreamName: "TEST_STREAM", StreamMaxAge: time.Hour, PublishTimeout: time.Second,
+	}, zap.NewNop())
+	if err != nil {
+		t.Fatalf("NewPublisher: %v", err)
+	}
+	if err := mockJS.DeleteStream("TEST_STREAM"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := pub.Publish(context.Background(), "test.subject", "id-1", []byte("x")); err != nil {
+		t.Fatalf("publish after the stream was lost: %v", err)
+	}
+	if _, ok := mockJS.GetStreams()["TEST_STREAM"]; !ok {
+		t.Fatal("stream not recreated")
+	}
+	if n := len(mockJS.GetPublishedMessages()); n != 1 {
+		t.Fatalf("published %d messages, want 1", n)
+	}
+}
+
+// When the stream cannot be created the publish still fails, with the original error.
+func TestPublisherReportsAStreamItCannotRecreate(t *testing.T) {
+	mockJS := NewMockJetStream()
+	pub, err := nats.NewPublisher(mockJS, nats.PublisherConfig{
+		StreamName: "TEST_STREAM", StreamMaxAge: time.Hour, PublishTimeout: time.Second,
+	}, zap.NewNop())
+	if err != nil {
+		t.Fatalf("NewPublisher: %v", err)
+	}
+	mockJS.SetPublishError(natsclient.ErrNoStreamResponse)
+
+	err = pub.Publish(context.Background(), "test.subject", "id-1", []byte("x"))
+	if !errors.Is(err, natsclient.ErrNoStreamResponse) {
+		t.Fatalf("got %v, want ErrNoStreamResponse", err)
+	}
+}
+
+// The stream takes its replica count from NATS_STREAM_REPLICAS, like the platform's other streams.
+func TestPublisherTakesReplicasFromTheEnvironment(t *testing.T) {
+	t.Setenv("NATS_STREAM_REPLICAS", "3")
+	mockJS := NewMockJetStream()
+	if _, err := nats.NewPublisher(mockJS, nats.PublisherConfig{
+		StreamName: "TEST_STREAM", StreamMaxAge: time.Hour, PublishTimeout: time.Second,
+	}, zap.NewNop()); err != nil {
+		t.Fatalf("NewPublisher: %v", err)
+	}
+	if got := mockJS.GetStreams()["TEST_STREAM"].Config.Replicas; got != 3 {
+		t.Fatalf("replicas = %d, want 3", got)
 	}
 }
