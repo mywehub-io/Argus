@@ -338,6 +338,23 @@ type TriggerNode struct {
 	Type          string   `json:"type"`
 	Payload    *Payload `json:"payload"`
 	StartedAt  int64    `json:"started_at"`
+
+	// ScopeNodeID is the connector step this node runs inside, when it is a node of a connector
+	// action spliced into the run (Olympus workplans/connector D6). Empty otherwise.
+	ScopeNodeID string `json:"scope_node_id,omitempty"`
+	// Hidden nodes are stored and never shown to the run's tenant: the inside of a connector action
+	// (D16). Monitoring reads them only through a support path.
+	Hidden bool `json:"hidden,omitempty"`
+}
+
+// ConnectorStep names the version a connector step ran, on the step's own node.started and
+// node.ended (Olympus workplans/connector E7-S01). Every field is empty for any other node.
+type ConnectorStep struct {
+	ConnectorProjectID string `json:"connector_project_id,omitempty"`
+	ActionKey          string `json:"action_key,omitempty"`
+	VersionID          string `json:"version_id,omitempty"`
+	Tag                string `json:"tag,omitempty"`
+	Mode               string `json:"mode,omitempty"`
 }
 
 type StartNode struct {
@@ -349,6 +366,8 @@ type StartNode struct {
 	Label         string   `json:"label,omitempty"` // Human-readable node label from execution plan
 	StartedAt     int64    `json:"started_at"`
 	Input         *Payload `json:"input"`
+
+	ConnectorStep
 }
 type EndNode struct {
 	WorkflowID   string   `json:"workflow_id"`
@@ -366,6 +385,8 @@ type EndNode struct {
 	ProjectID      string              `json:"project_id,omitempty"`      // For blob path and multi-tenant isolation
 	ContainsNodes  []string            `json:"contains_nodes,omitempty"`  // Node IDs whose outputs are in this unit result (parent + embedded)
 	ExecutionID    string              `json:"execution_id,omitempty"`    // Execution ID of the unit that produced this result
+
+	ConnectorStep
 }
 
 type Payload struct {
