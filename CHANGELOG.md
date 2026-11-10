@@ -22,8 +22,9 @@ Each entry is tagged `` `public:` `` or `` `internal:` ``:
   holds back another run. Without a lane on the context the emitters behave as before.
 - `public:` Events carry the time they were submitted: `StartedAt`, `EndedAt` and the event
   timestamp are stamped when the emitter is called, not when the event is published.
-- `public:` A lane holds at most `MaxQueuedBytes` (64 MiB); past it a submission runs on the
-  caller's goroutine, after its run's earlier events. Each write is bounded by `WriteTimeout`
+- `public:` A lane holds at most `MaxQueuedBytes` (64 MiB) and `MaxQueuedJobs` (16,384
+  documents, whatever their size, so tiny or lazily built documents cannot pile up as goroutines);
+  past either a submission runs on the caller's goroutine, after its run's earlier events. Each write is bounded by `WriteTimeout`
   (30 s), and a failed write still publishes the event without the document. `Drain(ctx)` waits
   for everything submitted; documents still queued when a process is killed are lost.
   `LaneHooks` report queued, inline, written and published for metrics.

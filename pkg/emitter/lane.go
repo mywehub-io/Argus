@@ -14,6 +14,7 @@ import (
 const (
 	DefaultLaneConcurrency          = 8
 	DefaultLaneMaxQueuedBytes int64 = 64 << 20
+	DefaultLaneMaxQueuedJobs        = 16384
 	DefaultLaneWriteTimeout         = 30 * time.Second
 )
 
@@ -24,6 +25,11 @@ type LaneOptions struct {
 	// MaxQueuedBytes bounds the document bytes held in the lane. A submission that would pass it
 	// is written and published on the caller's goroutine instead, after the run's earlier events.
 	MaxQueuedBytes int64
+	// MaxQueuedJobs bounds how many documents the lane holds, whatever their size: each is a
+	// goroutine until it is published, and a document built on the lane (Document.Build) counts
+	// towards no byte bound. A submission that would pass it runs on the caller's goroutine, as
+	// for MaxQueuedBytes.
+	MaxQueuedJobs int
 	// WriteTimeout bounds one document write, so a stuck request cannot hold back its run.
 	WriteTimeout time.Duration
 	// Hooks report what the lane does, for metrics. Every hook is optional.
@@ -55,6 +61,10 @@ type LaneHooks struct {
 //
 // Each event carries the time it was submitted, not the time it was published.
 //
+// The lane holds at most MaxQueuedBytes and MaxQueuedJobs; a submission past either is done on
+// the caller's goroutine, still after its run's earlier events, so memory stays bounded and
+// nothing is dropped.
+//
 // A document that cannot be written still has its event published, without the document, as the
 // synchronous path does. Documents queued when the process is killed are lost; Drain at shutdown
 // publishes what is left.
@@ -63,10 +73,11 @@ type Lane struct {
 	logger *zap.Logger
 	sem    chan struct{}
 
-	mu     sync.Mutex
-	runs   map[string]chan struct{} // per run: closed when its last submitted event is published
-	queued int64
-	wg     sync.WaitGroup
+	mu         sync.Mutex
+	runs       map[string]chan struct{} // per run: closed when its last submitted event is published
+	queued     int64                    // bytes of the documents queued
+	queuedJobs int                      // documents queued, whatever their size
+	wg         sync.WaitGroup
 }
 
 // NewLane returns a lane. Each document is written with the DocumentWriter of the emitter that
@@ -77,6 +88,9 @@ func NewLane(opts LaneOptions, logger *zap.Logger) *Lane {
 	}
 	if opts.MaxQueuedBytes <= 0 {
 		opts.MaxQueuedBytes = DefaultLaneMaxQueuedBytes
+	}
+	if opts.MaxQueuedJobs <= 0 {
+		opts.MaxQueuedJobs = DefaultLaneMaxQueuedJobs
 	}
 	if opts.WriteTimeout <= 0 {
 		opts.WriteTimeout = DefaultLaneWriteTimeout
@@ -97,6 +111,13 @@ func (l *Lane) QueuedBytes() int64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.queued
+}
+
+// QueuedJobs reports how many documents the lane holds.
+func (l *Lane) QueuedJobs() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.queuedJobs
 }
 
 // Drain waits until every submitted event has been published, or ctx ends. It returns an error
@@ -169,9 +190,10 @@ func (l *Lane) submit(ctx context.Context, job laneJob) error {
 	done := make(chan struct{})
 	l.runs[run] = done
 	l.wg.Add(1)
-	queue := l.queued+n <= l.opts.MaxQueuedBytes
+	queue := l.queued+n <= l.opts.MaxQueuedBytes && l.queuedJobs < l.opts.MaxQueuedJobs
 	if queue {
 		l.queued += n
+		l.queuedJobs++
 	}
 	l.mu.Unlock()
 
@@ -180,7 +202,7 @@ func (l *Lane) submit(ctx context.Context, job laneJob) error {
 		if h := l.opts.Hooks.Inline; h != nil {
 			h()
 		}
-		return l.run(ctx, job, prev, done, 0)
+		return l.run(ctx, job, prev, done, 0, false)
 	}
 	if h := l.opts.Hooks.Queued; h != nil {
 		h(int(n))
@@ -188,17 +210,21 @@ func (l *Lane) submit(ctx context.Context, job laneJob) error {
 	// The caller may reuse its buffer once this returns (a node's input is the unit's resolved
 	// payload), so the lane keeps its own copy.
 	job.data = append([]byte(nil), job.data...)
-	go func() { _ = l.run(context.WithoutCancel(ctx), job, prev, done, n) }()
+	go func() { _ = l.run(context.WithoutCancel(ctx), job, prev, done, n, true) }()
 	return nil
 }
 
 // run writes the job's document, waits for the run's previous event, publishes its own and
-// releases the run's slot.
-func (l *Lane) run(ctx context.Context, job laneJob, prev, done chan struct{}, queuedBytes int64) error {
+// releases the run's slot. queuedBytes and queued are what submit reserved for a queued job; an
+// inline job reserved nothing.
+func (l *Lane) run(ctx context.Context, job laneJob, prev, done chan struct{}, queuedBytes int64, queued bool) error {
 	defer l.wg.Done()
 	defer func() {
 		l.mu.Lock()
 		l.queued -= queuedBytes
+		if queued {
+			l.queuedJobs--
+		}
 		if l.runs[job.target.RunID] == done {
 			delete(l.runs, job.target.RunID)
 		}

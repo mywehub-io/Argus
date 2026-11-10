@@ -393,3 +393,75 @@ func TestLaneSubmitSendsWithoutTheDocumentWhenBuildFails(t *testing.T) {
 		t.Fatal("Submit accepted a document with nothing to write")
 	}
 }
+
+// The job bound applies whatever the documents' size: two tiny queued documents fill a lane of two,
+// and the third runs on the caller.
+func TestLaneRunsInlinePastTheJobBound(t *testing.T) {
+	w := newSlowWriter()
+	w.delay["n1"] = 40 * time.Millisecond
+	w.delay["n2"] = 40 * time.Millisecond
+	w.delay["n3"] = 10 * time.Millisecond
+	obs := &orderObserver{}
+	start := NewArgusNodeStartEmitter(obs, w, nil)
+	inline := 0
+	lane := NewLane(LaneOptions{MaxQueuedJobs: 2, Hooks: LaneHooks{Inline: func() { inline++ }}}, nil)
+	ctx := WithLane(context.Background(), lane)
+
+	_ = start.EmitNodeStart(ctx, startParams("r1", "n1"))
+	_ = start.EmitNodeStart(ctx, startParams("r2", "n2"))
+	if got := lane.QueuedJobs(); got != 2 {
+		t.Fatalf("queued jobs = %d, want 2", got)
+	}
+	_ = start.EmitNodeStart(ctx, startParams("r3", "n3")) // a third run: no order to wait for
+	if inline != 1 {
+		t.Fatalf("inline = %d, want 1 (the job bound, not the byte bound, was reached)", inline)
+	}
+	if len(obs.nodes("r3")) != 1 {
+		t.Fatal("the inline submission's event was not published when it returned")
+	}
+	if err := lane.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if lane.QueuedJobs() != 0 || lane.QueuedBytes() != 0 {
+		t.Fatalf("after drain: jobs %d, bytes %d", lane.QueuedJobs(), lane.QueuedBytes())
+	}
+}
+
+// A document built on the lane counts towards no byte bound, but it does count as a job.
+func TestLaneCountsBuiltDocumentsAsJobs(t *testing.T) {
+	w := newSlowWriter()
+	lane := NewLane(LaneOptions{MaxQueuedJobs: 1}, nil)
+	release := make(chan struct{})
+	built := Document{
+		Writer: w,
+		Target: DocumentTarget{WorkflowID: "wf", RunID: "r1", NodeID: "step", Direction: DirectionInput},
+		Build: func(context.Context) ([]byte, error) {
+			<-release
+			return []byte(`{}`), nil
+		},
+		Send: func(context.Context, *event.Payload) error { return nil },
+	}
+	if err := lane.Submit(context.Background(), built); err != nil {
+		t.Fatal(err)
+	}
+	if lane.QueuedJobs() != 1 || lane.QueuedBytes() != 0 {
+		t.Fatalf("jobs %d, bytes %d; want 1 and 0", lane.QueuedJobs(), lane.QueuedBytes())
+	}
+	second := built
+	second.Target.RunID = "r2"
+	second.Build = func(context.Context) ([]byte, error) { return []byte(`{}`), nil }
+	returned := make(chan struct{})
+	go func() {
+		_ = lane.Submit(context.Background(), second) // the bound is reached: runs on this goroutine
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("an inline submission did not finish on its own")
+	}
+	close(release)
+	if err := lane.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
