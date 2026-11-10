@@ -13,6 +13,15 @@ Each entry is tagged `` `public:` `` or `` `internal:` ``:
 
 ## [Unreleased]
 
+### Document lane: a full lane respects the caller's context
+
+- `public:` When the lane is full and a submission runs on the caller's goroutine, its waits for a
+  write slot and for its run's previous event now end with the caller's context. The emitter then
+  returns the context's error at once, writes nothing and publishes nothing: that event is lost to
+  monitoring, never published out of order. The run's later events still wait for the earlier
+  ones. Queued submissions are unaffected (their context never ends).
+- `public:` `LaneHooks.Abandoned(err)` reports such a submission.
+
 ### Document lane: node documents written off the unit's path
 
 - `public:` `emitter.NewLane(opts, logger)` and `emitter.WithLane(ctx, lane)`. With a lane on the

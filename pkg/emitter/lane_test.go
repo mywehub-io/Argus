@@ -465,3 +465,107 @@ func TestLaneCountsBuiltDocumentsAsJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// A caller whose submission runs inline (the lane is full) stops waiting for a write slot when its
+// context ends: it returns promptly with that error, writes nothing and publishes nothing.
+func TestLaneInlineGivesUpWaitingForAWriteSlot(t *testing.T) {
+	w := newSlowWriter()
+	w.delay["busy"] = 400 * time.Millisecond
+	obs := &orderObserver{}
+	start := NewArgusNodeStartEmitter(obs, w, nil)
+	var abandoned []error
+	lane := NewLane(LaneOptions{Concurrency: 1, MaxQueuedJobs: 1,
+		Hooks: LaneHooks{Abandoned: func(err error) { abandoned = append(abandoned, err) }}}, nil)
+
+	_ = start.EmitNodeStart(WithLane(context.Background(), lane), startParams("r1", "busy")) // takes the only slot
+	for deadline := time.Now().Add(time.Second); ; {
+		w.mu.Lock()
+		writing := w.inFlight
+		w.mu.Unlock()
+		if writing == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the queued job never started writing")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	ctx, cancel := context.WithTimeout(WithLane(context.Background(), lane), 30*time.Millisecond)
+	defer cancel()
+	began := time.Now()
+	err := start.EmitNodeStart(ctx, startParams("r2", "late")) // lane full: inline
+	if took := time.Since(began); took > 200*time.Millisecond {
+		t.Fatalf("inline submission returned after %v; it ignored its context", took)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want the context's deadline", err)
+	}
+	if len(abandoned) != 1 {
+		t.Fatalf("abandoned = %v, want one", abandoned)
+	}
+	if err := lane.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := obs.nodes("r2"); len(got) != 0 {
+		t.Fatalf("an abandoned submission published %v", got)
+	}
+	if _, ok := w.written["late.input"]; ok {
+		t.Fatal("an abandoned submission wrote its document")
+	}
+	if got := obs.nodes("r1"); len(got) != 1 {
+		t.Fatalf("the queued job's event = %v, want it published", got)
+	}
+}
+
+// A caller waiting inline for its run's previous event gives up when its context ends, and the run
+// keeps its order: a later event of the run still waits for the earlier, slower one.
+func TestLaneInlineGivesUpWaitingForTheRunAndKeepsItsOrder(t *testing.T) {
+	w := newSlowWriter()
+	w.delay["first"] = 300 * time.Millisecond
+	obs := &orderObserver{}
+	start := NewArgusNodeStartEmitter(obs, w, nil)
+	lane := NewLane(LaneOptions{Concurrency: 4, MaxQueuedJobs: 1}, nil)
+	bg := WithLane(context.Background(), lane)
+
+	_ = start.EmitNodeStart(bg, startParams("r1", "first")) // queued, slow
+	ctx, cancel := context.WithTimeout(bg, 30*time.Millisecond)
+	defer cancel()
+	began := time.Now()
+	err := start.EmitNodeStart(ctx, startParams("r1", "second")) // inline, waits for "first"
+	if took := time.Since(began); took > 200*time.Millisecond {
+		t.Fatalf("inline submission returned after %v; it ignored its context", took)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want the context's deadline", err)
+	}
+	// "first" is still being written. The next event of the run must not overtake it, although
+	// the job in between gave up.
+	_ = start.EmitNodeStart(bg, startParams("r1", "third"))
+	if err := lane.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	want := "first:" + event.TypeNodeStarted + ",third:" + event.TypeNodeStarted
+	if got := strings.Join(obs.nodes("r1"), ","); got != want {
+		t.Fatalf("order = %s, want %s (the abandoned event dropped, the rest in order)", got, want)
+	}
+}
+
+// The detached context of a queued job never ends, so a queued job is never abandoned, even when
+// its caller's context is cancelled at once.
+func TestLaneQueuedJobsAreNeverAbandoned(t *testing.T) {
+	w := newSlowWriter()
+	w.delay["n1"] = 20 * time.Millisecond
+	obs := &orderObserver{}
+	end := NewArgusNodeEndEmitter(obs, w, nil)
+	abandoned := 0
+	lane := NewLane(LaneOptions{Hooks: LaneHooks{Abandoned: func(error) { abandoned++ }}}, nil)
+	ctx, cancel := context.WithCancel(WithLane(context.Background(), lane))
+	_ = end.EmitNodeEnd(ctx, endParams("r1", "n1"))
+	cancel()
+	if err := lane.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if abandoned != 0 || len(obs.nodes("r1")) != 1 {
+		t.Fatalf("abandoned %d, events %v; want 0 and the event published", abandoned, obs.nodes("r1"))
+	}
+}
