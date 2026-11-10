@@ -81,14 +81,26 @@ func (e *ArgusNodeEndEmitter) EmitNodeEnd(ctx context.Context, params NodeEndEmi
 		return err
 	}
 
-	payload, err := documentPayload(ctx, e.documents, DocumentTarget{WorkflowID: params.WorkflowID, RunID: params.RunID,
-		NodeID: params.NodeID, Direction: DirectionOutput}, jsonBytes)
+	target := DocumentTarget{WorkflowID: params.WorkflowID, RunID: params.RunID, NodeID: params.NodeID, Direction: DirectionOutput}
+	endedAt := time.Now()
+	send := func(ctx context.Context, payload *event.Payload) error {
+		return e.send(ctx, params, endedAt, payload)
+	}
+	if lane := LaneFrom(ctx); lane != nil {
+		return lane.submit(ctx, laneJob{writer: e.documents, target: target, data: jsonBytes, submitted: endedAt, send: send})
+	}
+
+	payload, err := documentPayload(ctx, e.documents, target, jsonBytes)
 	if err != nil {
 		e.logger.Warn("node output document not written, sending node.ended without output",
 			zap.String("node_id", params.NodeID), zap.Error(err))
 		payload = &event.Payload{}
 	}
+	return send(ctx, payload)
+}
 
+// send builds the node.ended event around payload, stamped endedAt, and hands it to the observer.
+func (e *ArgusNodeEndEmitter) send(ctx context.Context, params NodeEndEmitParams, endedAt time.Time, payload *event.Payload) error {
 	evt := event.New(event.TypeNodeEnded).
 		WithClient(params.ClientID).
 		WithWorkflow(params.WorkflowID).
@@ -101,12 +113,13 @@ func (e *ArgusNodeEndEmitter) EmitNodeEnd(ctx context.Context, params NodeEndEmi
 			ProjectID:     params.ProjectID,
 			NodeID:        params.NodeID,
 			Label:         params.Label,
-			EndedAt:       time.Now().UnixMilli(),
+			EndedAt:       endedAt.UnixMilli(),
 			Output:        payload,
 			HasError:      params.HasError,
 			ErrorMessage:  params.ErrorMessage,
 			ContainsNodes: params.ContainsNodes,
 		})
+	evt.Timestamp = endedAt
 
 	if err := e.observer.Emit(ctx, evt); err != nil {
 		e.logger.Error("failed to emit node.ended observation event",
@@ -182,14 +195,27 @@ func (e *ArgusNodeStartEmitter) EmitNodeStart(ctx context.Context, params NodeSt
 		return nil
 	}
 
-	payload, err := documentPayload(ctx, e.documents, DocumentTarget{WorkflowID: params.WorkflowID, RunID: params.RunID,
-		NodeID: params.NodeID, Direction: DirectionInput}, params.Input)
+	target := DocumentTarget{WorkflowID: params.WorkflowID, RunID: params.RunID, NodeID: params.NodeID, Direction: DirectionInput}
+	startedAt := time.Now()
+	send := func(ctx context.Context, payload *event.Payload) error {
+		return e.send(ctx, params, startedAt, payload)
+	}
+	if lane := LaneFrom(ctx); lane != nil {
+		return lane.submit(ctx, laneJob{writer: e.documents, target: target, data: params.Input, submitted: startedAt, send: send})
+	}
+
+	payload, err := documentPayload(ctx, e.documents, target, params.Input)
 	if err != nil {
 		e.logger.Warn("node input document not written, sending node.started without input",
 			zap.String("node_id", params.NodeID), zap.Error(err))
 		payload = &event.Payload{}
 	}
+	return send(ctx, payload)
+}
 
+// send builds the node.started event around payload, stamped startedAt, and hands it to the
+// observer.
+func (e *ArgusNodeStartEmitter) send(ctx context.Context, params NodeStartEmitParams, startedAt time.Time, payload *event.Payload) error {
 	label := params.Label
 	if label == "" {
 		label = params.NodeID
@@ -206,9 +232,10 @@ func (e *ArgusNodeStartEmitter) EmitNodeStart(ctx context.Context, params NodeSt
 			ProjectID:  params.ProjectID,
 			NodeID:     params.NodeID,
 			Label:      label,
-			StartedAt:  time.Now().UnixMilli(),
+			StartedAt:  startedAt.UnixMilli(),
 			Input:      payload,
 		})
+	evt.Timestamp = startedAt
 
 	if err := e.observer.Emit(ctx, evt); err != nil {
 		e.logger.Error("failed to emit node.started observation event",
