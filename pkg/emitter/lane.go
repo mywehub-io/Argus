@@ -120,12 +120,42 @@ func (l *Lane) Drain(ctx context.Context) error {
 
 // laneJob is one document and the event that references it.
 type laneJob struct {
-	writer    DocumentWriter
-	target    DocumentTarget
-	data      []byte
+	writer DocumentWriter
+	target DocumentTarget
+	data   []byte
+	// build, when set, produces the document on the lane instead of data.
+	build     func(ctx context.Context) ([]byte, error)
 	submitted time.Time
 	// send builds the event around the document's payload and hands it to the observer.
 	send func(ctx context.Context, payload *event.Payload) error
+}
+
+// Document is one node document and the event that references it, for a caller that builds its
+// own event: a connector step's node.started and node.ended carry fields the node emitters do not.
+type Document struct {
+	// Writer writes the document; Target names it.
+	Writer DocumentWriter
+	Target DocumentTarget
+	// Data is the document. When it is nil, Build is called on the lane instead, so a document
+	// that takes a read to assemble costs the unit nothing. Build returning nil and no error
+	// means there is no document: the event is sent without one and nothing is written.
+	Data  []byte
+	Build func(ctx context.Context) ([]byte, error)
+	// Send builds the event around the document's payload and hands it to the observer. The
+	// payload is empty when the document could not be built or written. Send runs after the
+	// run's earlier events have been published.
+	Send func(ctx context.Context, payload *event.Payload) error
+}
+
+// Submit hands a document and its event to the lane, as the node emitters do with a lane on the
+// context. It returns once the document is queued, or, when the lane is full, once its event has
+// been published on the caller's goroutine. The submission time is the caller's to stamp on the
+// event it builds in Send.
+func (l *Lane) Submit(ctx context.Context, d Document) error {
+	if d.Send == nil || (d.Data == nil && d.Build == nil) {
+		return fmt.Errorf("emitter: lane submit needs a document (Data or Build) and Send")
+	}
+	return l.submit(ctx, laneJob{writer: d.Writer, target: d.Target, data: d.Data, build: d.Build, submitted: time.Now(), send: d.Send})
 }
 
 // submit hands a job to the lane. It returns once the job is queued, or, when the lane is full,
@@ -197,7 +227,18 @@ func (l *Lane) write(ctx context.Context, job laneJob) *event.Payload {
 	wctx, cancel := context.WithTimeout(ctx, l.opts.WriteTimeout)
 	defer cancel()
 	start := time.Now()
-	payload, err := documentPayload(wctx, job.writer, job.target, job.data)
+	data, err := job.data, error(nil)
+	if job.build != nil {
+		data, err = job.build(wctx)
+	}
+	if err == nil && data == nil && job.build != nil {
+		// Build had no document to give (a step with no input): the event goes without one.
+		return &event.Payload{}
+	}
+	var payload *event.Payload
+	if err == nil {
+		payload, err = documentPayload(wctx, job.writer, job.target, data)
+	}
 	if h := l.opts.Hooks.Written; h != nil {
 		h(time.Since(start), err)
 	}

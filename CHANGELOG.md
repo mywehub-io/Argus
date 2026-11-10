@@ -27,6 +27,10 @@ Each entry is tagged `` `public:` `` or `` `internal:` ``:
   (30 s), and a failed write still publishes the event without the document. `Drain(ctx)` waits
   for everything submitted; documents still queued when a process is killed are lost.
   `LaneHooks` report queued, inline, written and published for metrics.
+- `public:` `Lane.Submit(ctx, emitter.Document{...})` is the same path for a caller that builds
+  its own event (a connector step). `Document.Build` produces the document on the lane, so one
+  that takes a read to assemble costs the caller nothing; a document built lazily does not count
+  towards `MaxQueuedBytes`.
 
 ### Breaking: payloads are references (raw payloads hard cut)
 

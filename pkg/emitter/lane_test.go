@@ -305,3 +305,91 @@ func TestEmittersStaySynchronousWithoutALane(t *testing.T) {
 		t.Fatal("without a lane the event was not published before EmitNodeEnd returned")
 	}
 }
+
+// A caller that builds its own events (a connector step) submits them directly; a document built
+// on the lane costs the caller nothing, and its events keep their order with the run's others.
+func TestLaneSubmitBuildsTheDocumentOnTheLane(t *testing.T) {
+	w := newSlowWriter()
+	obs := &orderObserver{}
+	lane := NewLane(LaneOptions{}, nil)
+	end := NewArgusNodeEndEmitter(obs, w, nil)
+	ctx := WithLane(context.Background(), lane)
+
+	built := make(chan struct{})
+	send := func(node string) func(context.Context, *event.Payload) error {
+		return func(ctx context.Context, p *event.Payload) error {
+			e := event.New(event.TypeNodeEnded).WithClient("c").WithWorkflow("wf").WithRun("r1").WithNode(node).
+				WithData(&event.EndNode{WorkflowID: "wf", RunID: "r1", ClientID: "c", NodeID: node, Output: p})
+			return obs.Emit(ctx, e)
+		}
+	}
+	began := time.Now()
+	err := lane.Submit(ctx, Document{
+		Writer: w,
+		Target: DocumentTarget{WorkflowID: "wf", RunID: "r1", NodeID: "step", Direction: DirectionOutput},
+		Build: func(context.Context) ([]byte, error) {
+			time.Sleep(30 * time.Millisecond) // a read to assemble the document
+			close(built)
+			return []byte(`{"ok":true}`), nil
+		},
+		Send: send("step"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if took := time.Since(began); took > 15*time.Millisecond {
+		t.Fatalf("Submit took %v; the document was built on the caller", took)
+	}
+	_ = end.EmitNodeEnd(ctx, endParams("r1", "after"))
+	if err := lane.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-built
+	if got := obs.nodes("r1"); strings.Join(got, ",") != "step:"+event.TypeNodeEnded+",after:"+event.TypeNodeEnded {
+		t.Fatalf("order = %v", got)
+	}
+	if out := endData(t, obs.events[0]).Output; out == nil || out.Document == nil {
+		t.Fatalf("submitted event has no document: %+v", out)
+	}
+}
+
+func TestLaneSubmitSendsWithoutTheDocumentWhenBuildFails(t *testing.T) {
+	obs := &orderObserver{}
+	lane := NewLane(LaneOptions{}, nil)
+	var got *event.Payload
+	err := lane.Submit(context.Background(), Document{
+		Writer: newSlowWriter(),
+		Target: DocumentTarget{WorkflowID: "wf", RunID: "r1", NodeID: "step", Direction: DirectionInput},
+		Build:  func(context.Context) ([]byte, error) { return nil, errors.New("archive unreadable") },
+		Send: func(ctx context.Context, p *event.Payload) error {
+			got = p
+			return obs.Emit(ctx, event.New(event.TypeNodeStarted))
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lane.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.Document != nil {
+		t.Fatalf("payload = %+v, want an empty one", got)
+	}
+	var none *event.Payload
+	w := newSlowWriter()
+	_ = lane.Submit(context.Background(), Document{
+		Writer: w,
+		Target: DocumentTarget{WorkflowID: "wf", RunID: "r2", NodeID: "step", Direction: DirectionInput},
+		Build:  func(context.Context) ([]byte, error) { return nil, nil },
+		Send:   func(_ context.Context, p *event.Payload) error { none = p; return nil },
+	})
+	if err := lane.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if none == nil || none.Document != nil || len(w.written) != 0 {
+		t.Fatalf("no-document build: payload %+v, writes %d", none, len(w.written))
+	}
+	if err := lane.Submit(context.Background(), Document{}); err == nil {
+		t.Fatal("Submit accepted a document with nothing to write")
+	}
+}
