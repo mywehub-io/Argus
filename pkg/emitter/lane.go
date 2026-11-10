@@ -47,6 +47,9 @@ type LaneHooks struct {
 	// Published is called after each event is handed to the observer, with the time from
 	// submission and the observer's error.
 	Published func(sinceSubmit time.Duration, err error)
+	// Abandoned is called when a submission that ran on the caller's goroutine (the lane was
+	// full) gave up because the caller's context ended: its event was not published.
+	Abandoned func(err error)
 }
 
 // Lane writes node documents and publishes their events off the unit's critical path.
@@ -217,9 +220,16 @@ func (l *Lane) submit(ctx context.Context, job laneJob) error {
 // run writes the job's document, waits for the run's previous event, publishes its own and
 // releases the run's slot. queuedBytes and queued are what submit reserved for a queued job; an
 // inline job reserved nothing.
+//
+// A queued job runs under a context that never ends (submit detaches it), so only an inline job,
+// running under its caller's context, can give up. It gives up while waiting for a write slot,
+// for the run's previous event, or once its context has ended by the time it would publish. It
+// then publishes nothing: its event is lost to monitoring, but the run's order is kept.
 func (l *Lane) run(ctx context.Context, job laneJob, prev, done chan struct{}, queuedBytes int64, queued bool) error {
-	defer l.wg.Done()
-	defer func() {
+	// finish releases what the job holds and lets the run's next job publish. A job that gives up
+	// calls it only once the run's previous job has finished, never earlier: closing done early
+	// would let the next job publish ahead of an event still queued before this one.
+	finish := func() {
 		l.mu.Lock()
 		l.queued -= queuedBytes
 		if queued {
@@ -230,13 +240,24 @@ func (l *Lane) run(ctx context.Context, job laneJob, prev, done chan struct{}, q
 		}
 		l.mu.Unlock()
 		close(done)
-	}()
-
-	payload := l.write(ctx, job)
-
-	if prev != nil {
-		<-prev
+		l.wg.Done()
 	}
+
+	payload, ok := l.write(ctx, job)
+	if !ok {
+		return l.abandon(ctx, job, prev, finish)
+	}
+	if prev != nil {
+		select {
+		case <-prev:
+		case <-ctx.Done():
+			return l.abandon(ctx, job, prev, finish)
+		}
+	}
+	if ctx.Err() != nil {
+		return l.abandon(ctx, job, nil, finish)
+	}
+	defer finish()
 	err := job.send(ctx, payload)
 	if h := l.opts.Hooks.Published; h != nil {
 		h(time.Since(job.submitted), err)
@@ -244,10 +265,39 @@ func (l *Lane) run(ctx context.Context, job laneJob, prev, done chan struct{}, q
 	return err
 }
 
+// abandon records that a job running on its caller's goroutine gave up because the caller's
+// context ended, and returns at once with that context's error. Its slot in the run is released
+// once prev (the run's previous job, if still pending) has finished, so the run's order holds.
+func (l *Lane) abandon(ctx context.Context, job laneJob, prev chan struct{}, finish func()) error {
+	err := ctx.Err()
+	if h := l.opts.Hooks.Abandoned; h != nil {
+		h(err)
+	}
+	l.logger.Warn("node event not sent: the lane was full and the caller's context ended while it waited",
+		zap.String("run_id", job.target.RunID),
+		zap.String("node_id", job.target.NodeID),
+		zap.String("direction", job.target.Direction),
+		zap.Error(err))
+	if prev == nil {
+		finish()
+	} else {
+		go func() {
+			<-prev
+			finish()
+		}()
+	}
+	return err
+}
+
 // write writes the job's document within the lane's concurrency and timeout. A failure is logged
-// and yields an empty payload, so the event is still published.
-func (l *Lane) write(ctx context.Context, job laneJob) *event.Payload {
-	l.sem <- struct{}{}
+// and yields an empty payload, so the event is still published. ok is false when ctx ended while
+// the job waited for a write slot: nothing was written.
+func (l *Lane) write(ctx context.Context, job laneJob) (payload *event.Payload, ok bool) {
+	select {
+	case l.sem <- struct{}{}:
+	case <-ctx.Done():
+		return nil, false
+	}
 	defer func() { <-l.sem }()
 
 	wctx, cancel := context.WithTimeout(ctx, l.opts.WriteTimeout)
@@ -259,9 +309,8 @@ func (l *Lane) write(ctx context.Context, job laneJob) *event.Payload {
 	}
 	if err == nil && data == nil && job.build != nil {
 		// Build had no document to give (a step with no input): the event goes without one.
-		return &event.Payload{}
+		return &event.Payload{}, true
 	}
-	var payload *event.Payload
 	if err == nil {
 		payload, err = documentPayload(wctx, job.writer, job.target, data)
 	}
@@ -274,9 +323,9 @@ func (l *Lane) write(ctx context.Context, job laneJob) *event.Payload {
 			zap.String("node_id", job.target.NodeID),
 			zap.String("direction", job.target.Direction),
 			zap.Error(err))
-		return &event.Payload{}
+		return &event.Payload{}, true
 	}
-	return payload
+	return payload, true
 }
 
 type laneKey struct{}
