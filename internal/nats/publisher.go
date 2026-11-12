@@ -27,7 +27,15 @@ type PublisherConfig struct {
 	StreamMaxMsgs  int64
 	StreamMaxBytes int64
 	PublishTimeout time.Duration
+	// VerifyOnly stops the publisher creating the stream or changing its size cap: it only looks
+	// the stream up. A missing stream is then not an error at start; events are refused until
+	// the platform creates it. A customer runner in NATS operator mode may not create streams.
+	VerifyOnly bool
 }
+
+// ErrStreamMissingVerifyOnly is returned when the stream does not exist and the publisher is
+// verify-only, so it may not create it.
+var ErrStreamMissingVerifyOnly = errors.New("observation stream does not exist and this publisher may not create it (verify-only)")
 
 // Publisher handles publishing messages to NATS JetStream.
 // All methods are safe for concurrent use.
@@ -67,7 +75,12 @@ func NewPublisher(js nats.JetStreamContext, config PublisherConfig, logger *zap.
 
 	p := &Publisher{js: js, config: config, logger: logger}
 	if err := p.ensureStream(); err != nil {
-		return nil, fmt.Errorf("failed to ensure observation stream: %w", err)
+		if !errors.Is(err, ErrStreamMissingVerifyOnly) {
+			return nil, fmt.Errorf("failed to ensure observation stream: %w", err)
+		}
+		// The platform creates the stream. Publishing finds it once it exists (see Publish).
+		logger.Warn("Observation stream does not exist yet and this publisher may not create it; events are refused until it exists",
+			zap.String("stream", config.StreamName))
 	}
 	return p, nil
 }
@@ -84,7 +97,13 @@ func (p *Publisher) ensureStream() error {
 		p.logger.Info("Observation stream already exists",
 			zap.String("stream", p.config.StreamName),
 			zap.Uint64("messages", streamInfo.State.Msgs))
+		if p.config.VerifyOnly {
+			return nil
+		}
 		return p.ensureSizeCap(streamInfo.Config)
+	}
+	if p.config.VerifyOnly {
+		return fmt.Errorf("stream %q: %w", p.config.StreamName, ErrStreamMissingVerifyOnly)
 	}
 
 	streamConfig := &nats.StreamConfig{
@@ -227,11 +246,11 @@ func (p *Publisher) recreateStream() bool {
 	err := p.ensureStream()
 	p.lastOK = err == nil
 	if err != nil {
-		p.logger.Warn("Observation stream is missing and could not be recreated",
+		p.logger.Warn("Observation stream is missing and could not be recreated (or, verify-only, is not there yet)",
 			zap.String("stream", p.config.StreamName), zap.Error(err))
 		return false
 	}
-	p.logger.Warn("Observation stream was missing; ensured it again",
+	p.logger.Warn("Observation stream was missing; it exists again",
 		zap.String("stream", p.config.StreamName))
 	return true
 }

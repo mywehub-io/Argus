@@ -13,6 +13,18 @@ Each entry is tagged `` `public:` `` or `` `internal:` ``:
 
 ## [Unreleased]
 
+### Added: verify-only observer
+
+- `public:` `observer.Options.VerifyOnly` (`WithVerifyOnly`): the observer only looks the
+  observation stream up. It never creates it, never changes its size cap, and does not recreate it
+  when a publish finds it gone. `NewObserver` succeeds while the stream is missing; events are
+  refused until the platform creates it. Off by default, so existing callers are unchanged. For
+  customer runners under NATS operator mode, which have no right to create or update streams.
+
+## [0.5.0] — 2026-10-09
+
+v0.6.0 and v0.7.0 were tagged without changelog entries.
+
 ### Breaking: payloads are references (raw payloads hard cut)
 
 - `public:` `event.Payload` carries `Document` and `Files` only. `InlineData`, `BlobReference`
