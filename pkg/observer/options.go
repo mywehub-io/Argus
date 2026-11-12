@@ -41,6 +41,12 @@ type Options struct {
 	// Default: 30 seconds.
 	DropLogInterval time.Duration
 
+	// VerifyOnly stops the observer creating the observation stream or changing its size cap; it
+	// only looks the stream up. Events are refused (and counted as failed) while the stream is
+	// missing, and published once the platform creates it. A customer runner in NATS operator
+	// mode is not allowed to create or update streams. Default: false (create if missing).
+	VerifyOnly bool
+
 	// CloseFlushTimeout bounds how long Close waits for queued events to be published when the
 	// caller's context has no deadline. Default: 5 seconds.
 	CloseFlushTimeout time.Duration
@@ -63,6 +69,12 @@ func DefaultOptions() Options {
 // WithAsync turns on async mode with a queue of queueSize events (see AsyncQueueSize).
 func (o Options) WithAsync(queueSize int) Options {
 	o.AsyncQueueSize = queueSize
+	return o
+}
+
+// WithVerifyOnly sets VerifyOnly.
+func (o Options) WithVerifyOnly(on bool) Options {
+	o.VerifyOnly = on
 	return o
 }
 
