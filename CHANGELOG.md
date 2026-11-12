@@ -21,6 +21,35 @@ Each entry is tagged `` `public:` `` or `` `internal:` ``:
   refused until the platform creates it. Off by default, so existing callers are unchanged. For
   customer runners under NATS operator mode, which have no right to create or update streams.
 
+### Document lane: a full lane respects the caller's context
+
+- `public:` When the lane is full and a submission runs on the caller's goroutine, its waits for a
+  write slot and for its run's previous event now end with the caller's context. The emitter then
+  returns the context's error at once, writes nothing and publishes nothing: that event is lost to
+  monitoring, never published out of order. The run's later events still wait for the earlier
+  ones. Queued submissions are unaffected (their context never ends).
+- `public:` `LaneHooks.Abandoned(err)` reports such a submission.
+
+### Document lane: node documents written off the unit's path
+
+- `public:` `emitter.NewLane(opts, logger)` and `emitter.WithLane(ctx, lane)`. With a lane on the
+  context, `EmitNodeStart` and `EmitNodeEnd` return at once; the lane writes the node's document
+  (up to `Concurrency` at a time) and publishes the event once the document is written and the
+  run's earlier events are published. Runs are ordered independently, so one slow write never
+  holds back another run. Without a lane on the context the emitters behave as before.
+- `public:` Events carry the time they were submitted: `StartedAt`, `EndedAt` and the event
+  timestamp are stamped when the emitter is called, not when the event is published.
+- `public:` A lane holds at most `MaxQueuedBytes` (64 MiB) and `MaxQueuedJobs` (16,384
+  documents, whatever their size, so tiny or lazily built documents cannot pile up as goroutines);
+  past either a submission runs on the caller's goroutine, after its run's earlier events. Each write is bounded by `WriteTimeout`
+  (30 s), and a failed write still publishes the event without the document. `Drain(ctx)` waits
+  for everything submitted; documents still queued when a process is killed are lost.
+  `LaneHooks` report queued, inline, written and published for metrics.
+- `public:` `Lane.Submit(ctx, emitter.Document{...})` is the same path for a caller that builds
+  its own event (a connector step). `Document.Build` produces the document on the lane, so one
+  that takes a read to assemble costs the caller nothing; a document built lazily does not count
+  towards `MaxQueuedBytes`.
+
 ## [0.5.0] — 2026-10-09
 
 v0.6.0 and v0.7.0 were tagged without changelog entries.
