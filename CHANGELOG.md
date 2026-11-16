@@ -13,6 +13,14 @@ Each entry is tagged `` `public:` `` or `` `internal:` ``:
 
 ## [Unreleased]
 
+### Added: verify-only observer
+
+- `public:` `observer.Options.VerifyOnly` (`WithVerifyOnly`): the observer only looks the
+  observation stream up. It never creates it, never changes its size cap, and does not recreate it
+  when a publish finds it gone. `NewObserver` succeeds while the stream is missing; events are
+  refused until the platform creates it. Off by default, so existing callers are unchanged. For
+  customer runners under NATS operator mode, which have no right to create or update streams.
+
 ### Document lane: a full lane respects the caller's context
 
 - `public:` When the lane is full and a submission runs on the caller's goroutine, its waits for a
@@ -41,6 +49,10 @@ Each entry is tagged `` `public:` `` or `` `internal:` ``:
   its own event (a connector step). `Document.Build` produces the document on the lane, so one
   that takes a read to assemble costs the caller nothing; a document built lazily does not count
   towards `MaxQueuedBytes`.
+
+## [0.5.0] — 2026-10-09
+
+v0.6.0 and v0.7.0 were tagged without changelog entries.
 
 ### Breaking: payloads are references (raw payloads hard cut)
 

@@ -92,6 +92,7 @@ func NewObserver(js natsclient.JetStreamContext, opts Options, logger *zap.Logge
 		StreamMaxMsgs:  opts.StreamMaxMsgs,
 		StreamMaxBytes: opts.StreamMaxBytes,
 		PublishTimeout: opts.PublishTimeout,
+		VerifyOnly:     opts.VerifyOnly,
 	}
 	publisher, err := nats.NewPublisher(js, publisherConfig, logger)
 	if err != nil {
