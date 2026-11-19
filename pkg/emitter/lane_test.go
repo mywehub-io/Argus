@@ -569,3 +569,174 @@ func TestLaneQueuedJobsAreNeverAbandoned(t *testing.T) {
 		t.Fatalf("abandoned %d, events %v; want 0 and the event published", abandoned, obs.nodes("r1"))
 	}
 }
+
+func TestLaneFlushReturnsAtOnceForARunWithNothingPending(t *testing.T) {
+	lane := NewLane(LaneOptions{}, nil)
+	if err := lane.Flush(context.Background(), "nothing-submitted"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLaneFlushWaitsForTheRunsEvents(t *testing.T) {
+	w := newSlowWriter()
+	w.delay["n1"] = 40 * time.Millisecond
+	w.delay["n2"] = 40 * time.Millisecond
+	obs := &orderObserver{}
+	start := NewArgusNodeStartEmitter(obs, w, nil)
+	end := NewArgusNodeEndEmitter(obs, w, nil)
+	lane := NewLane(LaneOptions{}, nil)
+	ctx := WithLane(context.Background(), lane)
+
+	began := time.Now()
+	_ = start.EmitNodeStart(ctx, startParams("r1", "n1"))
+	_ = end.EmitNodeEnd(ctx, endParams("r1", "n1"))
+	_ = end.EmitNodeEnd(ctx, endParams("r1", "n2"))
+	if err := lane.Flush(context.Background(), "r1"); err != nil {
+		t.Fatal(err)
+	}
+	took := time.Since(began)
+	if got := obs.nodes("r1"); len(got) != 3 {
+		t.Fatalf("Flush returned with %d of 3 events published: %v", len(got), got)
+	}
+	// Written concurrently: about one 40 ms write, not three.
+	if took < 35*time.Millisecond || took > 110*time.Millisecond {
+		t.Fatalf("Flush took %v, want about one write (40 ms)", took)
+	}
+}
+
+func TestLaneFlushIgnoresOtherRuns(t *testing.T) {
+	w := newSlowWriter()
+	w.delay["slow"] = 300 * time.Millisecond
+	obs := &orderObserver{}
+	end := NewArgusNodeEndEmitter(obs, w, nil)
+	lane := NewLane(LaneOptions{}, nil)
+	ctx := WithLane(context.Background(), lane)
+
+	_ = end.EmitNodeEnd(ctx, endParams("slow-run", "slow"))
+	_ = end.EmitNodeEnd(ctx, endParams("fast-run", "fast"))
+	began := time.Now()
+	if err := lane.Flush(context.Background(), "fast-run"); err != nil {
+		t.Fatal(err)
+	}
+	if took := time.Since(began); took > 150*time.Millisecond {
+		t.Fatalf("Flush of one run waited %v for another run's slow write", took)
+	}
+	if err := lane.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLaneFlushHonoursItsContextAndStillPublishes(t *testing.T) {
+	w := newSlowWriter()
+	w.delay["n1"] = 150 * time.Millisecond
+	obs := &orderObserver{}
+	end := NewArgusNodeEndEmitter(obs, w, nil)
+	lane := NewLane(LaneOptions{}, nil)
+
+	_ = end.EmitNodeEnd(WithLane(context.Background(), lane), endParams("r1", "n1"))
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := lane.Flush(ctx, "r1"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Flush = %v, want context.DeadlineExceeded", err)
+	}
+	if err := lane.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := obs.nodes("r1"); len(got) != 1 {
+		t.Fatalf("event not published after the flush gave up: %v", got)
+	}
+}
+
+func TestLaneFlushDoesNotWaitForLaterSubmissions(t *testing.T) {
+	w := newSlowWriter()
+	w.delay["early"] = 30 * time.Millisecond
+	w.delay["late"] = 400 * time.Millisecond
+	obs := &orderObserver{}
+	end := NewArgusNodeEndEmitter(obs, w, nil)
+	lane := NewLane(LaneOptions{}, nil)
+	ctx := WithLane(context.Background(), lane)
+
+	_ = end.EmitNodeEnd(ctx, endParams("r1", "early"))
+	done := make(chan time.Duration, 1)
+	began := time.Now()
+	go func() {
+		_ = lane.Flush(context.Background(), "r1")
+		done <- time.Since(began)
+	}()
+	time.Sleep(10 * time.Millisecond) // the flush has taken the run's tail by now
+	_ = end.EmitNodeEnd(ctx, endParams("r1", "late"))
+	if took := <-done; took > 200*time.Millisecond {
+		t.Fatalf("Flush took %v; it waited for an event submitted after it was called", took)
+	}
+	if err := lane.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLaneChainsInOneRunDoNotWaitForEachOther(t *testing.T) {
+	w := newSlowWriter()
+	w.delay["slow"] = 300 * time.Millisecond
+	obs := &orderObserver{}
+	end := NewArgusNodeEndEmitter(obs, w, nil)
+	lane := NewLane(LaneOptions{}, nil)
+	base := WithLane(context.Background(), lane)
+
+	// Two units of one run, each on its own chain: the first has a slow document.
+	_ = end.EmitNodeEnd(WithLaneChain(base, "r1#1"), endParams("r1", "slow"))
+	_ = end.EmitNodeEnd(WithLaneChain(base, "r1#2"), endParams("r1", "fast"))
+	began := time.Now()
+	if err := lane.Flush(context.Background(), "r1#2"); err != nil {
+		t.Fatal(err)
+	}
+	if took := time.Since(began); took > 150*time.Millisecond {
+		t.Fatalf("Flush of one unit's chain waited %v for another unit's slow write in the same run", took)
+	}
+	if got := obs.nodes("r1"); len(got) != 1 || got[0] != "fast:"+event.TypeNodeEnded {
+		t.Fatalf("published when the fast chain flushed = %v, want only the fast unit's event", got)
+	}
+	if err := lane.Flush(context.Background(), "r1#1"); err != nil {
+		t.Fatal(err)
+	}
+	if got := obs.nodes("r1"); len(got) != 2 {
+		t.Fatalf("events after both flushes = %v, want 2", got)
+	}
+}
+
+func TestLaneKeepsOrderWithinAChain(t *testing.T) {
+	w := newSlowWriter()
+	w.delay["first"] = 60 * time.Millisecond
+	obs := &orderObserver{}
+	start := NewArgusNodeStartEmitter(obs, w, nil)
+	end := NewArgusNodeEndEmitter(obs, w, nil)
+	lane := NewLane(LaneOptions{}, nil)
+	ctx := WithLaneChain(WithLane(context.Background(), lane), "r1#7")
+
+	_ = start.EmitNodeStart(ctx, startParams("r1", "first"))
+	_ = end.EmitNodeEnd(ctx, endParams("r1", "second"))
+	if err := lane.Flush(context.Background(), "r1#7"); err != nil {
+		t.Fatal(err)
+	}
+	want := "first:" + event.TypeNodeStarted + ",second:" + event.TypeNodeEnded
+	if got := strings.Join(obs.nodes("r1"), ","); got != want {
+		t.Fatalf("chain order = %s, want %s", got, want)
+	}
+}
+
+func TestLaneWithoutAChainKeyChainsByRun(t *testing.T) {
+	w := newSlowWriter()
+	w.delay["slow"] = 80 * time.Millisecond
+	obs := &orderObserver{}
+	end := NewArgusNodeEndEmitter(obs, w, nil)
+	lane := NewLane(LaneOptions{}, nil)
+	ctx := WithLaneChain(WithLane(context.Background(), lane), "") // empty key: no chain of its own
+
+	_ = end.EmitNodeEnd(ctx, endParams("r1", "slow"))
+	_ = end.EmitNodeEnd(ctx, endParams("r1", "fast"))
+	if err := lane.Flush(context.Background(), "r1"); err != nil {
+		t.Fatal(err)
+	}
+	want := "slow:" + event.TypeNodeEnded + ",fast:" + event.TypeNodeEnded
+	if got := strings.Join(obs.nodes("r1"), ","); got != want {
+		t.Fatalf("run-chained order = %s, want %s", got, want)
+	}
+}

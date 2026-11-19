@@ -23,7 +23,7 @@ type LaneOptions struct {
 	// Concurrency is how many documents are written at once, across every run.
 	Concurrency int
 	// MaxQueuedBytes bounds the document bytes held in the lane. A submission that would pass it
-	// is written and published on the caller's goroutine instead, after the run's earlier events.
+	// is written and published on the caller's goroutine instead, after the chain's earlier events.
 	MaxQueuedBytes int64
 	// MaxQueuedJobs bounds how many documents the lane holds, whatever their size: each is a
 	// goroutine until it is published, and a document built on the lane (Document.Build) counts
@@ -58,14 +58,15 @@ type LaneHooks struct {
 // then return, so a unit waits for every one of its documents in turn. With a lane on the context
 // (WithLane), they hand the document to the lane and return at once. The lane writes documents
 // concurrently, up to Concurrency at a time, and publishes each event only once its document is
-// written and every earlier event of the same run has been published. Monitoring therefore never
-// receives a reference to a document that does not exist yet, and a run's events keep the order
-// they were submitted in. Runs do not wait for each other.
+// written and every earlier event of its chain has been published. A chain is the run, unless the
+// context names a narrower one (WithLaneChain), such as one unit of the run. Monitoring therefore
+// never receives a reference to a document that does not exist yet, and a chain's events keep the
+// order they were submitted in. Chains do not wait for each other.
 //
 // Each event carries the time it was submitted, not the time it was published.
 //
 // The lane holds at most MaxQueuedBytes and MaxQueuedJobs; a submission past either is done on
-// the caller's goroutine, still after its run's earlier events, so memory stays bounded and
+// the caller's goroutine, still after its chain's earlier events, so memory stays bounded and
 // nothing is dropped.
 //
 // A document that cannot be written still has its event published, without the document, as the
@@ -77,7 +78,7 @@ type Lane struct {
 	sem    chan struct{}
 
 	mu         sync.Mutex
-	runs       map[string]chan struct{} // per run: closed when its last submitted event is published
+	runs       map[string]chan struct{} // per chain: closed when its last submitted event is published
 	queued     int64                    // bytes of the documents queued
 	queuedJobs int                      // documents queued, whatever their size
 	wg         sync.WaitGroup
@@ -123,6 +124,31 @@ func (l *Lane) QueuedJobs() int {
 	return l.queuedJobs
 }
 
+// Flush waits until every event submitted to chain before the call has been published, or ctx
+// ends, and then returns ctx's error. chain is the key given to WithLaneChain, or the run ID for
+// events submitted without one. Events submitted after the call are not waited for, and a chain
+// with nothing pending returns at once.
+//
+// A unit calls it before handing over its result: the result is what ends the run, so without it
+// a run can end, and be read, before its node events reach monitoring. Flush only holds the
+// caller; the events are published whether or not anyone waits for them.
+func (l *Lane) Flush(ctx context.Context, chain string) error {
+	l.mu.Lock()
+	tail := l.runs[chain]
+	l.mu.Unlock()
+	if tail == nil {
+		return nil
+	}
+	// tail closes only once the chain's last submitted job has published, and each job publishes
+	// only after the one before it, so every earlier event of the chain is out by then.
+	select {
+	case <-tail:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // Drain waits until every submitted event has been published, or ctx ends. It returns an error
 // naming how many were still pending when ctx ended. The lane stays usable after Drain.
 func (l *Lane) Drain(ctx context.Context) error {
@@ -150,6 +176,8 @@ type laneJob struct {
 	// build, when set, produces the document on the lane instead of data.
 	build     func(ctx context.Context) ([]byte, error)
 	submitted time.Time
+	// chain orders the job: it publishes after the chain's earlier jobs (see WithLaneChain).
+	chain string
 	// send builds the event around the document's payload and hands it to the observer.
 	send func(ctx context.Context, payload *event.Payload) error
 }
@@ -167,7 +195,7 @@ type Document struct {
 	Build func(ctx context.Context) ([]byte, error)
 	// Send builds the event around the document's payload and hands it to the observer. The
 	// payload is empty when the document could not be built or written. Send runs after the
-	// run's earlier events have been published.
+	// chain's earlier events have been published.
 	Send func(ctx context.Context, payload *event.Payload) error
 }
 
@@ -186,7 +214,8 @@ func (l *Lane) Submit(ctx context.Context, d Document) error {
 // once the job's event has been published on this goroutine.
 func (l *Lane) submit(ctx context.Context, job laneJob) error {
 	n := int64(len(job.data))
-	run := job.target.RunID
+	job.chain = chainFrom(ctx, job.target.RunID)
+	run := job.chain
 
 	l.mu.Lock()
 	prev := l.runs[run]
@@ -201,7 +230,7 @@ func (l *Lane) submit(ctx context.Context, job laneJob) error {
 	l.mu.Unlock()
 
 	if !queue {
-		// Full: do the work here, still after the run's earlier events.
+		// Full: do the work here, still after the chain's earlier events.
 		if h := l.opts.Hooks.Inline; h != nil {
 			h()
 		}
@@ -217,17 +246,17 @@ func (l *Lane) submit(ctx context.Context, job laneJob) error {
 	return nil
 }
 
-// run writes the job's document, waits for the run's previous event, publishes its own and
-// releases the run's slot. queuedBytes and queued are what submit reserved for a queued job; an
+// run writes the job's document, waits for the chain's previous event, publishes its own and
+// releases the chain's slot. queuedBytes and queued are what submit reserved for a queued job; an
 // inline job reserved nothing.
 //
 // A queued job runs under a context that never ends (submit detaches it), so only an inline job,
 // running under its caller's context, can give up. It gives up while waiting for a write slot,
-// for the run's previous event, or once its context has ended by the time it would publish. It
-// then publishes nothing: its event is lost to monitoring, but the run's order is kept.
+// for the chain's previous event, or once its context has ended by the time it would publish. It
+// then publishes nothing: its event is lost to monitoring, but the chain's order is kept.
 func (l *Lane) run(ctx context.Context, job laneJob, prev, done chan struct{}, queuedBytes int64, queued bool) error {
-	// finish releases what the job holds and lets the run's next job publish. A job that gives up
-	// calls it only once the run's previous job has finished, never earlier: closing done early
+	// finish releases what the job holds and lets the chain's next job publish. A job that gives up
+	// calls it only once the chain's previous job has finished, never earlier: closing done early
 	// would let the next job publish ahead of an event still queued before this one.
 	finish := func() {
 		l.mu.Lock()
@@ -235,8 +264,8 @@ func (l *Lane) run(ctx context.Context, job laneJob, prev, done chan struct{}, q
 		if queued {
 			l.queuedJobs--
 		}
-		if l.runs[job.target.RunID] == done {
-			delete(l.runs, job.target.RunID)
+		if l.runs[job.chain] == done {
+			delete(l.runs, job.chain)
 		}
 		l.mu.Unlock()
 		close(done)
@@ -266,8 +295,8 @@ func (l *Lane) run(ctx context.Context, job laneJob, prev, done chan struct{}, q
 }
 
 // abandon records that a job running on its caller's goroutine gave up because the caller's
-// context ended, and returns at once with that context's error. Its slot in the run is released
-// once prev (the run's previous job, if still pending) has finished, so the run's order holds.
+// context ended, and returns at once with that context's error. Its slot in the chain is released
+// once prev (the chain's previous job, if still pending) has finished, so the chain's order holds.
 func (l *Lane) abandon(ctx context.Context, job laneJob, prev chan struct{}, finish func()) error {
 	err := ctx.Err()
 	if h := l.opts.Hooks.Abandoned; h != nil {
@@ -275,6 +304,7 @@ func (l *Lane) abandon(ctx context.Context, job laneJob, prev chan struct{}, fin
 	}
 	l.logger.Warn("node event not sent: the lane was full and the caller's context ended while it waited",
 		zap.String("run_id", job.target.RunID),
+		zap.String("chain", job.chain),
 		zap.String("node_id", job.target.NodeID),
 		zap.String("direction", job.target.Direction),
 		zap.Error(err))
@@ -320,6 +350,7 @@ func (l *Lane) write(ctx context.Context, job laneJob) (payload *event.Payload, 
 	if err != nil {
 		l.logger.Warn("node document not written, sending its event without it",
 			zap.String("run_id", job.target.RunID),
+			zap.String("chain", job.chain),
 			zap.String("node_id", job.target.NodeID),
 			zap.String("direction", job.target.Direction),
 			zap.Error(err))
@@ -329,6 +360,30 @@ func (l *Lane) write(ctx context.Context, job laneJob) (payload *event.Payload, 
 }
 
 type laneKey struct{}
+
+type laneChainKey struct{}
+
+// WithLaneChain returns ctx whose lane submissions form their own chain, key, instead of joining
+// every event of their run. Events of one chain publish in the order they were submitted; chains
+// never wait for each other. A runner gives each unit its own chain, so parallel units of a run do
+// not hold back each other's events; it then flushes the unit's chain (Flush) before handing over
+// the unit's result, which keeps a run's sequential units in order. An empty key leaves ctx as is.
+func WithLaneChain(ctx context.Context, key string) context.Context {
+	if key == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, laneChainKey{}, key)
+}
+
+// chainFrom is the chain a submission on ctx joins: WithLaneChain's key, or else its run.
+func chainFrom(ctx context.Context, runID string) string {
+	if ctx != nil {
+		if key, _ := ctx.Value(laneChainKey{}).(string); key != "" {
+			return key
+		}
+	}
+	return runID
+}
 
 // WithLane returns ctx carrying lane. The node emitters use it when they find it, so code that
 // runs below an API it cannot change (an embedded runtime given the unit's context) uses the
