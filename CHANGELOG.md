@@ -13,6 +13,19 @@ Each entry is tagged `` `public:` `` or `` `internal:` ``:
 
 ## [Unreleased]
 
+### Document lane: flush a run before handing over its result
+
+- `public:` `Lane.Flush(ctx, runID)` waits until every event submitted for the run before the call
+  has been published, or `ctx` ends (it then returns the context's error). A run with nothing
+  pending returns at once, and later submissions are not waited for. A runner calls it after a
+  unit has written its result and before handing the result over, so a result that ends the run
+  can no longer reach the platform ahead of the run's node events. The events are published
+  whether or not anyone flushes.
+- `public:` `emitter.WithLaneChain(ctx, key)`: lane submissions on that context form their own
+  chain instead of joining every event of their run, so parallel units of one run no longer hold
+  back each other's events. `Flush` takes the chain key (the run ID for submissions without one).
+  Without a key the lane orders by run, as before. Lane log lines carry `chain` beside `run_id`.
+
 ### Added: verify-only observer
 
 - `public:` `observer.Options.VerifyOnly` (`WithVerifyOnly`): the observer only looks the
